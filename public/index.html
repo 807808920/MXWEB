@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>机器拓扑</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">M</span><span>Metax Communication Group</span></div>
+    <div id="connection" class="connection"><i></i>等待采集</div>
+  </header>
+  <main>
+    <section class="scan-bar" aria-label="机器连接">
+      <div class="segmented" role="tablist"><button class="active" data-kind="local">本机</button><button data-kind="remote">远程 SSH</button></div>
+      <label class="profile-field">运行模式<select id="profile"><option value="auto">自动识别</option><option value="physical">物理机 / Docker</option><option value="virtualized">虚拟化</option></select></label>
+      <div id="remote-fields" class="remote-fields" hidden>
+        <label>地址<input id="host" placeholder="192.168.1.20"></label>
+        <label>用户<input id="user" placeholder="root"></label>
+        <label>端口<input id="port" type="number" value="22"></label>
+        <label>私钥路径<input id="identity-file" placeholder="~/.ssh/id_ed25519"></label>
+      </div>
+      <label class="password-field">登录 / sudo 密码<input id="password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，不保存"></label>
+      <button id="scan" class="scan-button"><span class="spinner" hidden></span><span class="button-label">采集拓扑</span></button>
+      <button id="root-scan" class="scan-button root-scan-button" title="使用 root 或密码框中的 sudo 密码执行只读采集"><span class="spinner" hidden></span><span class="button-label">Root 采集</span></button>
+      <p id="scan-note">在本机执行只读硬件查询，不需要 root 权限。</p>
+      <div id="scan-progress" class="scan-progress" role="progressbar" aria-label="采集进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div class="progress-track"><i></i></div><span id="progress-label">准备采集</span></div>
+    </section>
+    <section class="machine-heading">
+      <div><p class="eyebrow">硬件互连视图</p><h1 id="hostname">未选择机器</h1><p id="collected-at">采集后将展示 CPU、GPU、NIC 与 PCIe Switch 的关系。</p><p id="compliance-summary" class="compliance-summary">尚未执行合规检查</p></div>
+      <div class="counts"><div><strong id="count-cpu">-</strong><span>NUMA / CPU</span></div><div><strong id="count-gpu">-</strong><span>GPU</span></div><div><strong id="count-nic">-</strong><span>NIC</span></div><div><strong id="count-switch">-</strong><span>PCIe Switch</span></div></div>
+    </section>
+    <section class="inspection" aria-label="基础巡检">
+      <div class="panel-title"><div><h2>基础巡检</h2><p>只读采集。黄色为需要结合集群 profile 或权限进一步核验的项目。</p></div><span id="inspection-total">-</span></div>
+      <div id="inspection-checks" class="inspection-checks"><p class="empty">采集后显示基础环境检查。</p></div>
+    </section>
+    <section class="workspace">
+      <aside class="device-panel"><div class="panel-title"><h2>设备清单</h2><span id="device-total">0</span></div><div id="device-list" class="device-list"><p class="empty">尚无采集结果</p></div></aside>
+      <section class="topology-panel"><div class="panel-title"><div><h2>PCIe 拓扑</h2><p>单击 ± 按钮或双击节点展开/折叠下级；滚轮缩放；拖动可调整布局。</p></div><div class="graph-tools"><button id="zoom-out" class="icon-button" title="缩小" aria-label="缩小">−</button><button id="zoom-in" class="icon-button" title="放大" aria-label="放大">+</button><button id="fit" class="icon-button" title="重置视图与布局" aria-label="重置视图与布局">⌖</button></div></div><div id="graph-wrap"><svg id="graph" viewBox="0 0 960 600" role="img" aria-label="PCIe 硬件拓扑图"></svg><div id="graph-empty" class="graph-empty">等待采集硬件信息</div></div><div class="legend"><span><i class="cpu-dot"></i>CPU / NUMA</span><span><i class="gpu-dot"></i>GPU</span><span><i class="switch-dot"></i>PCIe Switch</span><span><i class="nic-dot"></i>NIC</span><span><i class="link-sample"></i>GPU Link</span><span><i class="invalid-dot"></i>存在不合规项</span></div></section>
+      <aside class="detail-panel"><div class="panel-title"><h2>设备详情</h2></div><div id="detail" class="detail"><p class="empty">在左侧设备列表或图中选择设备。</p></div></aside>
+    </section>
+    <section class="diagnostics"><div class="panel-title"><div><h2>原始诊断输出</h2><p>用于核对驱动和链路状态。</p></div><div class="tabs"><button class="active" data-output="gpuTopo">mx-smi topo</button><button data-output="ibstat">ibstat</button><button data-output="pcieControls">PCIe 控制</button><button data-output="roce">RoCE</button><button data-output="gids">GID</button><button data-output="dmesg">dmesg</button><button data-output="ofed">ofed_info</button><button data-output="macainfo">macainfo</button></div></div><pre id="terminal">尚无输出</pre></section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
