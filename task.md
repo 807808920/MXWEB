@@ -84,3 +84,33 @@
     - hiddensize 默认 7168，可支持配置
     - token数量 [1,2,4,8,16,32,64] for low latency, [128,256,512,1024,2048,4096,8192] for internode/intranode, 可以支持逗号进行多轮测试
     - 测试结果主要关心 平均延时（带宽）
+
+
+补充需求8:
+    - 单机测试需要支持容器或者镜像运行。（已支持）
+    - GPU单项 vectorAdd测试 支持多卡测试，另外可进行GPU卡的选择
+    - 移除 GPU带宽， GPU metaxlink， GPU pcie测试
+
+需求9：
+ - 网卡单项改成网卡测试：
+    - 支持P2P测试，alltoall测试
+    - P2P测试支持选择GPU和网卡，选择完后可显示它们的连接关系
+    - alltoall测试支持选择网卡范围和GPU范围，选择完后显示它们的拓扑关系
+
+需求10：
+    - P2P 测试选择两个不同 GPU，并为每张 GPU 分别选择一个网卡，两端允许选择同一个 RDMA HCA
+    - 选择网卡时自动显示它与对应 GPU 的 PIX/PXB/NODE/SYS 距离
+    - P2P 在当前目标内通过 localhost 自动启动服务端和客户端，不再填写对端地址
+    - P2P 保留 InfiniBand/RoCE 网络类型及 RoCE GID Index 配置
+    - P2P 与 alltoall 的所选设备拓扑改为弹框展示
+
+
+    网卡测试P2P 里面选择GPU后，选择网卡 里面的文字不需要显示网卡名称 只显示mlx5_0,numa0,400G,up这种格式；
+    基本功能测试左边测试项不需要占用太多空间，多给一些空间给右边配置项
+    ib_write_bw 需要使用/opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw 路径
+    P2P测试可以选用相同的RDMA HCA
+    ib_write_bw 需要根据使用DMABUF/PEERMEM具体情况 觉得参数是否加上--use_maca_dmabuf
+
+    1.alltoall命令参考：MACA_VISIBLE_DEVICES=0,1 MCCL_IB_HCA=mlx5_0,mlx5_1 MCCL_IB_GID_INDEX=3 /opt/maca/ompi/bin/mpirun -n 2 /opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf
+    2.是否跑网卡/PCIE/METAX需要参考：mccl环境变量.md
+    根据以上两点修复网卡alltoall测试问题

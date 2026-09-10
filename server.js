@@ -1,6 +1,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const { randomBytes } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { StringDecoder } = require('node:string_decoder');
 
@@ -13,6 +14,13 @@ const MAX_TEST_OUTPUT = 4 * 1024 * 1024;
 const MAX_SINGLE_EP_OUTPUT = 8 * 1024 * 1024;
 const MAX_SINGLE_EP_CASE_OUTPUT = 2 * 1024 * 1024;
 const SINGLE_EP_CASE_TIMEOUT_MS = 300_000;
+const SINGLE_EP_STAGE_TIMEOUT_MS = 180_000;
+const TEST_STOP_GRACE_MS = 1_500;
+const TEST_CLEANUP_TIMEOUT_MS = 8_000;
+const IB_WRITE_BW_PATH = '/opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw';
+const MACA_MPIRUN_PATH = '/opt/maca/ompi/bin/mpirun';
+const MCCL_ALLTOALL_PATH = '/opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf';
+const MACA_LIBRARY_PATH_PREVIEW = 'export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH';
 const SINGLE_EP_TEST_DIR = process.env.SINGLEEP_TEST_DIR || '/home/lchen1/data/projs/llopt/codex/singleep/test';
 const SINGLE_EP_RANKS = [1, 2, 4, 8, 16, 32];
 const SINGLE_EP_TOKENS = {
@@ -25,23 +33,24 @@ const SINGLE_EP_TYPE_LABELS = {
   intranode: 'Intranode',
   internode: 'Internode'
 };
+const SINGLE_EP_RUNTIME_PROGRAMS = {
+  'low-latency': { launcher:'run.sh', executable:'test_low_latency' },
+  intranode: { launcher:'run_intranode.sh', executable:'test_intranode' },
+  internode: { launcher:'run_internode.sh', executable:'test_internode' }
+};
 const COLLECTION_TASKS = [
   ['META', '主机信息'], ['CPU', 'CPU / NUMA'], ['CPU_GOV', 'CPU 性能模式'],
   ['SYSTEM', '系统环境'], ['DMESG', '内核错误'], ['PCI_CTL', 'PCIe 控制'],
   ['PCI', 'PCIe 拓扑'], ['NET', '网卡设备'], ['IB', 'InfiniBand 状态'],
   ['IB_NET', 'RDMA 网口映射'], ['OFED', 'OFED 版本'], ['GIDS', 'GID 配置'],
-  ['ROCE', 'RoCE 配置'], ['GPU_TOPO', 'GPU 拓扑'], ['GPU_HEALTH', 'GPU 状态'],
+  ['ROCE', 'RoCE 配置'], ['GPU_TOPO', 'GPU 拓扑'], ['GPU_NIC_TOPO', 'GPU / 网卡距离'], ['GPU_HEALTH', 'GPU 状态'],
   ['MXLK', 'MetaxLink'], ['GPU_PCIE', 'GPU PCIe'], ['MACA', 'GPU 型号']
 ];
 const COLLECTION_TASK_LABELS = new Map(COLLECTION_TASKS);
 const TEST_LABELS = new Map([
   ['gpu-vector-add', 'GPU vectorAdd 测试'],
-  ['gpu-bandwidth', 'GPU 带宽测试'],
-  ['gpu-metaxlink', 'GPU MetaxLink alltoall'],
-  ['gpu-pcie', 'GPU PCIe alltoall'],
-  ['nic-bandwidth', '网卡带宽测试'],
-  ['nic-latency', '网卡时延测试'],
-  ['nic-alltoall', '网卡多流 alltoall'],
+  ['nic-p2p', '网卡 P2P 测试'],
+  ['nic-alltoall', '网卡 alltoall 测试'],
   ['host-ibrc', '单机 IBRC 测试'],
   ['host-ibgda', '单机 IBGDA 测试']
 ]);
@@ -103,12 +112,11 @@ gdr_info() {
 
   gdr_perftest_dmabuf=unknown
   gdr_perftest_path=unknown
-  for gdr_perftest in /opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw /opt/maca/samples/mccl_tests/ib_perf/tests/ib_write_bw; do
-    [ -x "$gdr_perftest" ] || continue
+  gdr_perftest=/opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw
+  if [ -x "$gdr_perftest" ]; then
     gdr_perftest_path=$gdr_perftest
     if "$gdr_perftest" --help 2>&1 | grep -q -- '--use_maca_dmabuf'; then gdr_perftest_dmabuf=yes; else gdr_perftest_dmabuf=no; fi
-    break
-  done
+  fi
 
   gdr_ib_reg_addr=$(cat /sys/module/metax/parameters/ib_reg_addr 2>/dev/null)
   gdr_ib_unreg_addr=$(cat /sys/module/metax/parameters/ib_unreg_addr 2>/dev/null)
@@ -147,6 +155,40 @@ system_info() {
   printf 'video_group\t%s\n' "$(id -nG 2>/dev/null | tr ' ' '\n' | grep -qx video && echo yes || echo no)"
   printf 'vswitch_links\t%s\n' "$(if [ -e /opt/pci_switch_links ]; then echo present; else echo absent; fi)"
   gdr_info
+  for container_runtime in docker podman nerdctl; do
+    container_cli=$(command -v "$container_runtime" 2>/dev/null || true)
+    [ -n "$container_cli" ] || continue
+    if command -v timeout >/dev/null 2>&1; then
+      container_rows=$(timeout 4 "$container_cli" ps --no-trunc --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+    else
+      container_rows=$("$container_cli" ps --no-trunc --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null)
+    fi
+    container_rc=$?
+    if [ "$container_rc" -eq 0 ]; then
+      printf 'container_runtime\t%s\tavailable\n' "$container_runtime"
+      printf '%s\n' "$container_rows" | while IFS=$'\t' read -r container_id container_name container_image container_status; do
+        [ -n "$container_id" ] || continue
+        printf 'container\t%s\t%s\t%s\t%s\t%s\n' "$container_runtime" "$container_id" "$container_name" "$container_image" "$container_status"
+      done
+      if command -v timeout >/dev/null 2>&1; then
+        container_image_rows=$(timeout 6 "$container_cli" image ls --no-trunc --format '{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}' 2>/dev/null)
+      else
+        container_image_rows=$("$container_cli" image ls --no-trunc --format '{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}' 2>/dev/null)
+      fi
+      container_image_rc=$?
+      if [ "$container_image_rc" -eq 0 ]; then
+        printf 'container_image_runtime\t%s\tavailable\n' "$container_runtime"
+        printf '%s\n' "$container_image_rows" | while IFS=$'\t' read -r image_id image_repository image_tag image_size; do
+          [ -n "$image_id" ] || continue
+          printf 'container_image\t%s\t%s\t%s\t%s\t%s\n' "$container_runtime" "$image_id" "$image_repository" "$image_tag" "$image_size"
+        done
+      else
+        printf 'container_image_runtime\t%s\tunavailable\n' "$container_runtime"
+      fi
+    else
+      printf 'container_runtime\t%s\tunavailable\n' "$container_runtime"
+    fi
+  done
 }
 dmesg_info() { dmesg --level=emerg,alert,crit,err 2>&1 | tail -n 100; }
 pcie_ctl() {
@@ -206,6 +248,7 @@ ofed() { ofed_info -s 2>&1; }
 gids() { show_gids 2>&1; }
 roce() { for n in /sys/class/net/*; do [ -d "$n/device" ] || continue; name=$(basename "$n"); pfc=$(mlnx_qos -i "$name" 2>/dev/null | grep -E 'Priority trust state|PFC configuration|enabled' | tr '\n' ';'); ecn=$(find "$n/ecn" -type f -maxdepth 5 -print -exec sh -c 'printf "%s=%s;" "$1" "$(cat "$1" 2>/dev/null)"' _ {} \; 2>/dev/null | head -c 2000); tos=$(find /sys/class/infiniband -path '*/tc/*/traffic_class' -type f -exec sh -c 'printf "%s=%s;" "$1" "$(cat "$1" 2>/dev/null)"' _ {} \; 2>/dev/null | head -c 1000); [ -n "$pfc$ecn$tos" ] && printf '%s\t%s\t%s\t%s\n' "$name" "$pfc" "$ecn" "$tos"; done; }
 gpu_topo() { mx-smi topo -m 2>&1 || /opt/maca/bin/mx-smi topo -m 2>&1; }
+gpu_nic_topo() { mx-smi topo -n 2>&1 || /opt/maca/bin/mx-smi topo -n 2>&1; }
 gpu_health() { mx-smi -s 2>&1 || /opt/maca/bin/mx-smi -s 2>&1; }
 mxlk() { mx-smi mxlk --show 2>&1 || /opt/maca/bin/mx-smi mxlk --show 2>&1; }
 gpu_pcie() { mx-smi --show-pcie 2>&1 || /opt/maca/bin/mx-smi --show-pcie 2>&1; }
@@ -225,20 +268,21 @@ collect_task OFED OFED ofed &
 collect_task GIDS GIDS gids &
 collect_task ROCE ROCE roce &
 collect_task GPU_TOPO GPU_TOPO gpu_topo &
+collect_task GPU_NIC_TOPO GPU_NIC_TOPO gpu_nic_topo &
 collect_task GPU_HEALTH GPU_HEALTH gpu_health &
 collect_task MXLK MXLK mxlk &
 collect_task GPU_PCIE GPU_PCIE gpu_pcie &
 collect_task MACA MACA macainfo &
 wait
-for section in META CPU CPU_GOV SYSTEM DMESG PCI_CTL PCI NET IB IB_NET OFED GIDS ROCE GPU_TOPO GPU_HEALTH MXLK GPU_PCIE MACA; do printf '__%s__\n' "$section"; cat "$tmp/$section" 2>/dev/null; done
+for section in META CPU CPU_GOV SYSTEM DMESG PCI_CTL PCI NET IB IB_NET OFED GIDS ROCE GPU_TOPO GPU_NIC_TOPO GPU_HEALTH MXLK GPU_PCIE MACA; do printf '__%s__\n' "$section"; cat "$tmp/$section" 2>/dev/null; done
 true`;
 
 function parseSections(output) {
-  const names = ['META', 'CPU', 'CPU_GOV', 'SYSTEM', 'DMESG', 'PCI', 'PCI_CTL', 'NET', 'IB', 'IB_NET', 'OFED', 'GIDS', 'ROCE', 'GPU_TOPO', 'GPU_HEALTH', 'MXLK', 'GPU_PCIE', 'MACA'];
+  const names = ['META', 'CPU', 'CPU_GOV', 'SYSTEM', 'DMESG', 'PCI', 'PCI_CTL', 'NET', 'IB', 'IB_NET', 'OFED', 'GIDS', 'ROCE', 'GPU_TOPO', 'GPU_NIC_TOPO', 'GPU_HEALTH', 'MXLK', 'GPU_PCIE', 'MACA'];
   const sections = Object.fromEntries(names.map((name) => [name, '']));
   let current = null;
   for (const line of output.split(/\r?\n/)) {
-    const marker = /^__(META|CPU|CPU_GOV|SYSTEM|DMESG|PCI|PCI_CTL|NET|IB|IB_NET|OFED|GIDS|ROCE|GPU_TOPO|GPU_HEALTH|MXLK|GPU_PCIE|MACA)__$/.exec(line);
+    const marker = /^__(META|CPU|CPU_GOV|SYSTEM|DMESG|PCI|PCI_CTL|NET|IB|IB_NET|OFED|GIDS|ROCE|GPU_TOPO|GPU_NIC_TOPO|GPU_HEALTH|MXLK|GPU_PCIE|MACA)__$/.exec(line);
     if (marker) current = marker[1];
     else if (current) sections[current] += `${line}\n`;
   }
@@ -407,6 +451,50 @@ function parseMacainfo(text) {
   return { models: [...new Set(models)] };
 }
 
+function parseContainers(text) {
+  const runtimes = [];
+  const items = [];
+  const images = new Map();
+  const seen = new Set();
+  for (const line of text.split(/\r?\n/)) {
+    const fields = line.split('\t');
+    if (fields[0] === 'container_runtime') {
+      const runtime = fields[1] || '';
+      if (!['docker', 'podman', 'nerdctl'].includes(runtime) || runtimes.some((item) => item.name === runtime)) continue;
+      runtimes.push({ name:runtime, available:fields[2] === 'available' });
+      continue;
+    }
+    if (fields[0] === 'container_image_runtime') {
+      const runtime = fields[1] || '';
+      if (!['docker', 'podman', 'nerdctl'].includes(runtime)) continue;
+      let entry = runtimes.find((item) => item.name === runtime);
+      if (!entry) { entry = { name:runtime, available:false }; runtimes.push(entry); }
+      entry.imagesAvailable = fields[2] === 'available';
+      continue;
+    }
+    if (fields[0] === 'container_image') {
+      const [runtime, rawId, repository = '', tag = '', size = ''] = fields.slice(1);
+      const id = String(rawId || '').toLowerCase();
+      if (!['docker', 'podman', 'nerdctl'].includes(runtime) || !/^(?:sha256:)?[a-f0-9]{12,64}$/.test(id)) continue;
+      const key = `${runtime}:${id}`;
+      const reference = repository && repository !== '<none>'
+        ? `${repository}${tag && tag !== '<none>' ? `:${tag}` : ''}`
+        : '';
+      if (!images.has(key)) images.set(key, { runtime, id, references:[], size:size.slice(0, 64) });
+      const image = images.get(key);
+      if (reference && !image.references.includes(reference)) image.references.push(reference.slice(0, 512));
+      continue;
+    }
+    if (fields[0] !== 'container') continue;
+    const [runtime, id, name = '', image = '', status = ''] = fields.slice(1);
+    const key = `${runtime}:${id}`;
+    if (!['docker', 'podman', 'nerdctl'].includes(runtime) || !/^[a-f0-9]{12,64}$/i.test(id || '') || seen.has(key)) continue;
+    seen.add(key);
+    items.push({ runtime, id:id.toLowerCase(), name:name.slice(0, 128), image:image.slice(0, 512), status:status.slice(0, 256) });
+  }
+  return { runtimes, items, images:[...images.values()] };
+}
+
 function parseCpuGovernors(text) {
   const governors = new Map();
   for (const rawLine of text.split(/\r?\n/)) {
@@ -444,6 +532,8 @@ function evaluateGdrCompatibility(system, nodes, gpuCount) {
   const dmaBufReady = dmaBufRequirements.every(([, value]) => value === 'yes');
   const dmaBufBlocked = dmaBufRequirements.some(([, value]) => value === 'no');
   const peerMemReady = evidence.metaxDriver === 'yes' && evidence.peerMem === '1';
+  const perftestDmaBufReady = evidence.perftestDmaBuf === 'yes' && system.get('gdr_perftest_path') === IB_WRITE_BW_PATH;
+  const preferredMode = peerMemReady ? 'peermem' : (dmaBufReady && perftestDmaBufReady ? 'dmabuf' : '');
   const peerMemKnownUnavailable = evidence.peerMem === '0' || evidence.metaxDriver === 'no';
   const compatible = [];
   if (dmaBufReady) compatible.push('DMA-BUF');
@@ -477,10 +567,14 @@ function evaluateGdrCompatibility(system, nodes, gpuCount) {
     `PEERMEM ${peerMemReady ? '已注册' : evidence.peerMem === '0' ? '未注册（peer_mem=0）' : '状态未知'}`,
     evidence.perftestDmaBuf === 'yes' ? 'ib_write_bw 支持 --use_maca_dmabuf' : evidence.perftestDmaBuf === 'no' ? 'ib_write_bw 未提供 --use_maca_dmabuf' : '未确认 ib_write_bw DMA-BUF 选项'
   ].join('；');
-  const activation = dmaBufReady
-    ? 'DMA-BUF 按任务启用：ib_perf 使用 --use_maca_dmabuf；MCCL 设置 MCCL_DMABUF_ENABLE=1 和 MACA_NUMA_MEMORY_POLICY=1。'
-    : peerMemReady ? '当前 PEERMEM 已在驱动加载阶段注册，可直接用于 GDR MR 注册。' : '当前没有已确认可用的 GDR 显存注册机制。';
-  return { status, value, detail, activation, applicable:hasMetaxGpu && hasRdmaNic, driverConfigured, compatible, dmaBuf:{ ready:dmaBufReady, missing:missingDmaBuf, perftestPath:system.get('gdr_perftest_path') || '', evidence }, peerMem:{ ready:peerMemReady, property:evidence.peerMem, symbols:evidence.peerSymbols, ibRegAddr:evidence.ibRegAddr, ibUnregAddr:evidence.ibUnregAddr } };
+  const activation = preferredMode === 'peermem'
+    ? '当前使用 PEERMEM 注册 GDR 显存，ib_write_bw 不添加 --use_maca_dmabuf。'
+    : preferredMode === 'dmabuf'
+      ? '当前使用 DMA-BUF 注册 GDR 显存，ib_write_bw 在命令末尾添加 --use_maca_dmabuf。'
+      : dmaBufReady && !perftestDmaBufReady
+        ? `DMA-BUF 链路就绪，但指定的 ${IB_WRITE_BW_PATH} 未确认支持 --use_maca_dmabuf。`
+        : '当前没有已确认可用的 GDR 显存注册机制。';
+  return { status, value, detail, activation, preferredMode, applicable:hasMetaxGpu && hasRdmaNic, driverConfigured, compatible, dmaBuf:{ ready:dmaBufReady, usableForIbWrite:dmaBufReady && perftestDmaBufReady, missing:missingDmaBuf, perftestPath:system.get('gdr_perftest_path') || '', evidence }, peerMem:{ ready:peerMemReady, property:evidence.peerMem, symbols:evidence.peerSymbols, ibRegAddr:evidence.ibRegAddr, ibUnregAddr:evidence.ibUnregAddr } };
 }
 
 function issue(title, message, reference) { return { title, message, reference }; }
@@ -611,6 +705,28 @@ function parseTopo(text) {
   return links;
 }
 
+function parseGpuNicTopo(text) {
+  const rows = String(text || '').split(/\r?\n/).map((line) => line.trim().split(/\s+/)).filter((tokens) => tokens.length > 1);
+  const header = rows.find((tokens) => tokens.some((token) => /^GPU\d+$/i.test(token)) && tokens.some((token) => /^NIC\d+$/i.test(token)));
+  if (!header) return [];
+  const nicNames = new Map();
+  for (const match of String(text || '').matchAll(/^\s*(NIC\d+)\s*:\s*([^\s,]+)\s*$/gim)) nicNames.set(match[1].toUpperCase(), match[2]);
+  const nicColumns = header.map((token, index) => ({ token:token.toUpperCase(), index })).filter(({ token }) => /^NIC\d+$/.test(token));
+  const validDistances = new Set(['PIX', 'PXB', 'NODE', 'SYS']);
+  const distances = [];
+  for (const tokens of rows) {
+    if (tokens === header) continue;
+    const gpuMatch = /^GPU(\d+)$/i.exec(tokens[0]);
+    if (!gpuMatch) continue;
+    for (const column of nicColumns) {
+      const code = String(tokens[column.index + 1] || '').toUpperCase();
+      const nic = nicNames.get(column.token);
+      if (nic && validDistances.has(code)) distances.push({ gpu:Number(gpuMatch[1]), nic, code });
+    }
+  }
+  return distances;
+}
+
 function parseInventory(output, source, requestedProfile = 'auto') {
   const sections = parseSections(output);
   const meta = sections.META.trim().split(/\r?\n/);
@@ -627,6 +743,7 @@ function parseInventory(output, source, requestedProfile = 'auto') {
   const gpuHealth = parseGpuHealth(sections.GPU_HEALTH);
   const gpuPcie = parseGpuPcie(sections.GPU_PCIE);
   const macainfo = parseMacainfo(sections.MACA);
+  const containers = parseContainers(sections.SYSTEM);
   const devices = sections.PCI.trim().split(/\r?\n/).filter(Boolean).map((line) => typeFor(line.split('\t')));
   const gpuHealthByBdf = new Map(gpuHealth.devices.map((item) => [item.bdf, item]));
   const gpuPcieByBdf = new Map(gpuPcie.map((item) => [item.bdf, item]));
@@ -693,11 +810,12 @@ function parseInventory(output, source, requestedProfile = 'auto') {
       ...cpuInfo, os: system.get('os') || '', kernel: system.get('kernel') || '', systemArch: system.get('arch') || '',
       productName: system.get('product_name') || '', biosVersion: system.get('bios_version') || '', memoryKb: Number(system.get('memory_kb')) || null
     },
-    nodes: graphNodes, edges,
+    nodes: graphNodes, edges, containers,
     gpuLinks: parseTopo(sections.GPU_TOPO),
+    gpuNicDistances: parseGpuNicTopo(sections.GPU_NIC_TOPO),
     summary: { cpus: nodes.length, gpus: relevant.filter((item) => item.type === 'gpu').length, nics: relevant.filter((item) => item.type === 'nic').length, switches: relevant.filter((item) => item.type === 'switch').length },
     compliance,
-    diagnostics: { ibstat: sections.IB.trim(), gpuTopo: sections.GPU_TOPO.trim(), macainfo: sections.MACA.trim(), ofed: sections.OFED.trim(), system: sections.SYSTEM.trim(), dmesg: sections.DMESG.trim(), pcieControls: sections.PCI_CTL.trim(), gids: sections.GIDS.trim(), roce: sections.ROCE.trim(), gpuHealth: sections.GPU_HEALTH.trim(), mxlk: sections.MXLK.trim(), gpuPcie: sections.GPU_PCIE.trim() }
+    diagnostics: { ibstat: sections.IB.trim(), gpuTopo: sections.GPU_TOPO.trim(), gpuNicTopo: sections.GPU_NIC_TOPO.trim(), macainfo: sections.MACA.trim(), ofed: sections.OFED.trim(), system: sections.SYSTEM.trim(), dmesg: sections.DMESG.trim(), pcieControls: sections.PCI_CTL.trim(), gids: sections.GIDS.trim(), roce: sections.ROCE.trim(), gpuHealth: sections.GPU_HEALTH.trim(), mxlk: sections.MXLK.trim(), gpuPcie: sections.GPU_PCIE.trim() }
   };
 }
 
@@ -989,28 +1107,84 @@ async function collectCluster(config, onEvent) {
   };
 }
 
-function testRecipe(payload) {
+function testGpuList(value, label, minimum = 1) {
+  if (!Array.isArray(value) || value.length < minimum || value.length > 64) {
+    throw new Error(`${label}需要选择 ${minimum} 到 64 张 GPU。`);
+  }
+  const gpus = value.map((entry) => Number(entry));
+  if (gpus.some((gpu) => !Number.isInteger(gpu) || gpu < 0 || gpu > 63)) throw new Error('GPU 编号必须是 0 到 63 之间的整数。');
+  if (new Set(gpus).size !== gpus.length) throw new Error('GPU 选择中不能包含重复编号。');
+  return gpus;
+}
+
+function testNicList(value, { allowDuplicates = false } = {}) {
+  if (!Array.isArray(value) || !value.length || value.length > 64) throw new Error('请选择 1 到 64 个 RDMA HCA。');
+  const nics = value.map((entry) => String(entry || ''));
+  if (nics.some((nic) => !/^[a-zA-Z0-9_.:-]{1,64}$/.test(nic))) throw new Error('RDMA HCA 名称格式无效。');
+  if (!allowDuplicates && new Set(nics).size !== nics.length) throw new Error('RDMA HCA 选择中不能包含重复名称。');
+  return nics;
+}
+
+function createTestRunId() {
+  return randomBytes(12).toString('hex');
+}
+
+function validTestRunId(value) {
+  const runId = String(value || '');
+  if (!/^[a-f0-9]{24}$/.test(runId)) throw new Error('测试运行标识格式无效。');
+  return runId;
+}
+
+function testRecipe(payload, requestedRunId = createTestRunId()) {
+  const runId = validTestRunId(requestedRunId);
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('测试请求格式无效。');
   const testId = String(payload.testId || '');
   if (!TEST_LABELS.has(testId)) throw new Error('不支持该测试项。');
   if (payload.confirmed !== true) throw new Error('请先确认 GPU 空闲并接受性能测试影响。');
   const params = payload.params && typeof payload.params === 'object' && !Array.isArray(payload.params) ? payload.params : {};
-  const gpu = Number(params.gpu ?? 0);
+  const gpuA = Number(params.gpuA);
+  const gpuB = Number(params.gpuB);
   const gpuCount = Number(params.gpuCount ?? 2);
   const gidIndex = Number(params.gidIndex ?? 3);
   const nic = String(params.nic || '');
-  const peer = String(params.peer || '');
-  const transport = params.transport === 'IB' ? 'IB' : 'RoCE';
-  if (!Number.isInteger(gpu) || gpu < 0 || gpu > 63) throw new Error('GPU 编号必须在 0 到 63 之间。');
+  const nicA = String(params.nicA || '');
+  const nicB = String(params.nicB || '');
+  const transport = String(params.transport ?? 'RoCE');
+  const gdrMode = String(params.gdrMode || 'auto').toLowerCase();
+  const containerRuntime = String(params.containerRuntime || '');
+  const containerId = String(params.containerId || '');
+  const imageRuntime = String(params.imageRuntime || '');
+  const imageId = String(params.imageId || '');
   if (!Number.isInteger(gpuCount) || gpuCount < 1 || gpuCount > 64) throw new Error('GPU 数量必须在 1 到 64 之间。');
   if (!Number.isInteger(gidIndex) || gidIndex < 0 || gidIndex > 255) throw new Error('GID Index 必须在 0 到 255 之间。');
-  if (nic && !/^[a-zA-Z0-9_.:-]{1,64}$/.test(nic)) throw new Error('RDMA HCA 名称格式无效。');
-  if (peer && !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$/.test(peer)) throw new Error('对端地址格式无效。');
-  const nicTests = new Set(['nic-bandwidth', 'nic-latency', 'nic-alltoall', 'host-ibrc', 'host-ibgda']);
-  const peerTests = new Set(['nic-bandwidth', 'nic-latency', 'nic-alltoall']);
-  const multiGpuTests = new Set(['gpu-metaxlink', 'gpu-pcie', 'host-ibrc', 'host-ibgda']);
+  if (!['IB', 'RoCE'].includes(transport)) throw new Error('网络类型只支持 InfiniBand 或 RoCE。');
+  if (!['auto', 'dmabuf', 'peermem'].includes(gdrMode)) throw new Error('GDR 显存注册方式无效。');
+  if ([nic, nicA, nicB].some((value) => value && !/^[a-zA-Z0-9_.:-]{1,64}$/.test(value))) throw new Error('RDMA HCA 名称格式无效。');
+  if (Boolean(containerRuntime) !== Boolean(containerId)) throw new Error('容器运行时和容器 ID 必须同时提供。');
+  if (Boolean(imageRuntime) !== Boolean(imageId)) throw new Error('镜像运行时和镜像 ID 必须同时提供。');
+  if (containerId && imageId) throw new Error('运行中的容器和本地镜像不能同时选择。');
+  if (containerRuntime && !['docker', 'podman', 'nerdctl'].includes(containerRuntime)) throw new Error('不支持该容器运行时。');
+  if (containerId && !/^[a-f0-9]{12,64}$/i.test(containerId)) throw new Error('容器 ID 格式无效。');
+  if (imageRuntime && !['docker', 'podman', 'nerdctl'].includes(imageRuntime)) throw new Error('不支持该镜像运行时。');
+  if (imageId && !/^(?:sha256:)?[a-f0-9]{12,64}$/i.test(imageId)) throw new Error('镜像 ID 格式无效。');
+  let gpus = [];
+  let nics = [];
+  if (testId === 'gpu-vector-add') {
+    const requestedGpus = Array.isArray(params.gpus) ? params.gpus : [params.gpu ?? 0];
+    gpus = testGpuList(requestedGpus, 'vectorAdd');
+  } else if (testId === 'nic-p2p') {
+    if (!Number.isInteger(gpuA) || !Number.isInteger(gpuB)) throw new Error('请为 P2P 两端分别选择 GPU。');
+    if (gpuA === gpuB) throw new Error('P2P 两端必须选择不同 GPU。');
+    if (!nicA || !nicB) throw new Error('请为 P2P 两端分别选择 RDMA HCA。');
+    gpus = testGpuList([gpuA, gpuB], 'P2P', 2);
+    nics = testNicList([nicA, nicB], { allowDuplicates:true });
+  } else if (testId === 'nic-alltoall') {
+    gpus = testGpuList(params.gpus, 'alltoall', 2);
+    nics = testNicList(params.nics);
+  }
+  const nicTests = new Set(['host-ibrc', 'host-ibgda']);
+  const multiGpuTests = new Set(['host-ibrc', 'host-ibgda']);
   if (nicTests.has(testId) && !nic) throw new Error('该测试需要选择 RDMA HCA。');
-  if (peerTests.has(testId) && !peer) throw new Error('该测试需要填写对端地址。');
   if (multiGpuTests.has(testId) && gpuCount < 2) throw new Error('该测试至少需要 2 张 GPU。');
 
   const common = [
@@ -1022,19 +1196,31 @@ function testRecipe(payload) {
     `printf '=== ${TEST_LABELS.get(testId)} ===\\n'`,
     'printf "开始时间：%s\\n" "$(date -Is)"'
   ];
-  const gpuPreflight = [
+  const allGpuPreflight = [
     'busy_gpu="$( { mx-smi -s 2>/dev/null || /opt/maca/bin/mx-smi -s 2>/dev/null || true; } | awk \'/^[[:space:]]*GPU[[:space:]]*:/ { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { print value; exit } }\')"',
     'if [ -n "$busy_gpu" ]; then printf "检测到 GPU 使用率 %s%%，为避免影响现有任务已拒绝启动。\\n" "$busy_gpu" >&2; exit 3; fi'
   ];
   let lines = [...common];
   let preview = '';
   let timeoutMs = 180_000;
-  if (testId.startsWith('gpu-') || testId.startsWith('host-')) lines.push(...gpuPreflight);
+  if (testId.startsWith('host-')) lines.push(...allGpuPreflight);
+  if (testId === 'nic-p2p' || testId === 'nic-alltoall') {
+    const selectedGpuCsv = gpus.join(',');
+    lines.push(
+      `busy_gpu="$( { mx-smi -s 2>/dev/null || /opt/maca/bin/mx-smi -s 2>/dev/null || true; } | awk -v wanted=',${selectedGpuCsv},' '/^GPU#[0-9]+[[:space:]]/ { gpu=$1; sub(/^GPU#/, "", gpu); selected=index(wanted, "," gpu ",") > 0 } /^[[:space:]]*GPU[[:space:]]*:/ && selected { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { printf "GPU %s: %s%%", gpu, value; exit } }')"`,
+      'if [ -n "$busy_gpu" ]; then printf "检测到所选 %s 使用率超过 5%%，为避免影响现有任务已拒绝启动。\\n" "$busy_gpu" >&2; exit 3; fi'
+    );
+  }
 
   if (testId === 'gpu-vector-add') {
-    timeoutMs = 90_000;
-    preview = `MACA_VISIBLE_DEVICES=${gpu} vectorAdd`;
+    timeoutMs = Math.min(300_000, 80_000 + gpus.length * 10_000);
+    preview = `for gpu in ${gpus.join(' ')}; do MACA_VISIBLE_DEVICES=$gpu vectorAdd; done`;
+    const selectedGpuCsv = gpus.join(',');
     lines.push(
+      `selected_gpus=${shellSingleQuote(gpus.join(' '))}`,
+      `selected_gpu_count=${gpus.length}`,
+      `busy_gpu="$( { mx-smi -s 2>/dev/null || /opt/maca/bin/mx-smi -s 2>/dev/null || true; } | awk -v wanted=',${selectedGpuCsv},' '/^GPU#[0-9]+[[:space:]]/ { gpu=$1; sub(/^GPU#/, "", gpu); selected=index(wanted, "," gpu ",") > 0 } /^[[:space:]]*GPU[[:space:]]*:/ && selected { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { printf "GPU %s: %s%%", gpu, value; exit } }')"`,
+      'if [ -n "$busy_gpu" ]; then printf "检测到所选 %s 使用率超过 5%%，为避免影响现有任务已拒绝启动。\\n" "$busy_gpu" >&2; exit 3; fi',
       'sample_dir=/opt/maca/samples/0_Introduction/vectorAdd',
       'compiler=/opt/maca/mxgpu_llvm/bin/mxcc',
       '[ -r "$sample_dir/vectorAdd.cpp" ] || { echo "未安装 vectorAdd 示例源码。" >&2; exit 127; }',
@@ -1042,51 +1228,164 @@ function testRecipe(payload) {
       'work_dir="$(mktemp -d)"',
       'trap \'rm -rf "$work_dir"\' EXIT',
       '"$compiler" -x maca -offload-arch native "$sample_dir/vectorAdd.cpp" -o "$work_dir/vectorAdd" --maca-path=/opt/maca',
-      `MACA_VISIBLE_DEVICES=${gpu} "$work_dir/vectorAdd"`
+      'vector_failures=0',
+      'for gpu_index in $selected_gpus; do',
+      '  printf "\\n--- GPU %s vectorAdd ---\\n" "$gpu_index"',
+      '  if MACA_VISIBLE_DEVICES="$gpu_index" "$work_dir/vectorAdd"; then',
+      '    printf "[GPU %s] 通过\\n" "$gpu_index"',
+      '  else',
+      '    gpu_exit=$?',
+      '    printf "[GPU %s] 失败（退出码 %s）\\n" "$gpu_index" "$gpu_exit" >&2',
+      '    vector_failures=$((vector_failures + 1))',
+      '  fi',
+      'done',
+      'if [ "$vector_failures" -ne 0 ]; then printf "vectorAdd 汇总：%s/%s 张 GPU 失败。\\n" "$vector_failures" "$selected_gpu_count" >&2; exit 1; fi',
+      'printf "vectorAdd 汇总：所选 GPU（%s）全部通过。\\n" "${selected_gpus// /,}"'
     );
-  } else if (testId === 'gpu-bandwidth') {
-    preview = `MACA_VISIBLE_DEVICES=${gpu} TransferBenchMaca p2p`;
+  } else if (testId === 'nic-p2p') {
+    const gidOption = transport === 'RoCE' ? ` -x ${gidIndex}` : '';
+    const mxrdmaOptions = nics.some((name) => name.startsWith('metax_rdma_')) ? ' --disable_pcie_relaxed --use_old_post_send -n 10 -m 4096' : ' -F --report_gbits';
+    const p2pPort = 20_000 + (Number.parseInt(runId.slice(0, 4), 16) % 20_000);
+    const gdrPreviewOption = gdrMode === 'dmabuf' ? ' --use_maca_dmabuf' : '';
+    const gdrPreviewLabel = gdrMode === 'dmabuf'
+      ? 'DMA-BUF（追加 --use_maca_dmabuf）'
+      : gdrMode === 'peermem' ? 'PEERMEM（不追加 --use_maca_dmabuf）' : '运行时自动检测 DMA-BUF / PEERMEM';
+    preview = `GDR: ${gdrPreviewLabel}\nserver: ${IB_WRITE_BW_PATH} -a${mxrdmaOptions} -d ${nics[0]} --use_maca=${gpus[0]}${gidOption} -p ${p2pPort}${gdrPreviewOption} &\nclient: ${IB_WRITE_BW_PATH} -a${mxrdmaOptions} -d ${nics[1]} --use_maca=${gpus[1]}${gidOption} -p ${p2pPort} localhost${gdrPreviewOption}`;
     lines.push(
-      'transfer="$(first_exec /opt/maca/tools/communication/p2p/TransferBenchMaca /opt/maca/samples/mccl_tests/benchmark/TransferBenchMaca)"',
-      `export MACA_VISIBLE_DEVICES=${gpu} NUM_CPU_DEVICES=1 NUM_GPU_DEVICES=1 NUM_ITERATIONS=20 NUM_WARMUPS=3 P2P_MODE=1 DATA_CHECK=1`,
-      'exec "$transfer" p2p'
-    );
-  } else if (testId === 'gpu-metaxlink') {
-    preview = `NUM_GPU_DEVICES=${gpuCount} A2A_DIRECT=1 TransferBenchMaca a2a`;
-    lines.push(
-      'transfer="$(first_exec /opt/maca/tools/communication/p2p/TransferBenchMaca /opt/maca/samples/mccl_tests/benchmark/TransferBenchMaca)"',
-      `export NUM_CPU_DEVICES=0 NUM_GPU_DEVICES=${gpuCount} NUM_ITERATIONS=20 NUM_WARMUPS=3 A2A_DIRECT=1 SHOW_LINK_TYPE=1 DATA_CHECK=1`,
-      'exec "$transfer" a2a'
-    );
-  } else if (testId === 'gpu-pcie') {
-    preview = `NUM_GPU_DEVICES=${gpuCount} A2A_DIRECT=0 USE_GPU_DMA=1 TransferBenchMaca a2a`;
-    lines.push(
-      'transfer="$(first_exec /opt/maca/tools/communication/p2p/TransferBenchMaca /opt/maca/samples/mccl_tests/benchmark/TransferBenchMaca)"',
-      `export NUM_CPU_DEVICES=0 NUM_GPU_DEVICES=${gpuCount} NUM_ITERATIONS=20 NUM_WARMUPS=3 A2A_DIRECT=0 USE_GPU_DMA=1 SHOW_LINK_TYPE=1 DATA_CHECK=1`,
-      'exec "$transfer" a2a'
-    );
-  } else if (testId === 'nic-bandwidth') {
-    preview = `ib_write_bw -a -F --report_gbits -d ${nic}${transport === 'RoCE' ? ` -x ${gidIndex}` : ''} ${peer}`;
-    lines.push(
-      'ib_write="$(first_exec /opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw /opt/maca/samples/mccl_tests/ib_perf/tests/ib_write_bw /usr/bin/ib_write_bw)"',
-      transport === 'RoCE' ? `exec "$ib_write" -a -F --report_gbits -d ${nic} -x ${gidIndex} ${peer}` : `exec "$ib_write" -a -F --report_gbits -d ${nic} ${peer}`
-    );
-  } else if (testId === 'nic-latency') {
-    preview = `ib_read_lat -a -F -d ${nic}${transport === 'RoCE' ? ` -x ${gidIndex}` : ''} ${peer}`;
-    lines.push(
-      'ib_read_lat="$(first_exec /opt/maca/tools/communication/rdma/perftest/tests/ib_read_lat /opt/maca/samples/mccl_tests/ib_perf/tests/ib_read_lat /usr/bin/ib_read_lat)"',
-      transport === 'RoCE' ? `exec "$ib_read_lat" -a -F -d ${nic} -x ${gidIndex} ${peer}` : `exec "$ib_read_lat" -a -F -d ${nic} ${peer}`
+      `ib_write=${shellSingleQuote(IB_WRITE_BW_PATH)}`,
+      '[ -x "$ib_write" ] || { printf "缺少测试程序：%s\\n" "$ib_write" >&2; exit 127; }',
+      `p2p_gdr_hint=${shellSingleQuote(gdrMode)}`,
+      'p2p_peer_mem=unknown',
+      'for p2p_properties in /sys/class/mxcd/mxcd/layout/properties /sys/class/metax/mxcd/layout/properties; do',
+      '  [ -r "$p2p_properties" ] || continue',
+      "  p2p_peer_value=\"$(awk '$1 == \"peer_mem\" { print $2; exit }' \"$p2p_properties\")\"",
+      '  if [ "$p2p_peer_value" = 0 ] || [ "$p2p_peer_value" = 1 ]; then p2p_peer_mem=$p2p_peer_value; break; fi',
+      'done',
+      'p2p_kmd_dmabuf=unknown',
+      'p2p_metax_info="$(modinfo metax 2>/dev/null || true)"',
+      'if [ -n "$p2p_metax_info" ]; then',
+      '  if printf "%s\\n" "$p2p_metax_info" | grep -Eq "^import_ns:.*DMA_BUF"; then',
+      '    p2p_kmd_dmabuf=yes',
+      '  elif command -v strings >/dev/null 2>&1; then',
+      "    p2p_metax_module=\"$(printf '%s\\n' \"$p2p_metax_info\" | awk '/^filename:/{print $2; exit}')\"",
+      '    if [ -r "$p2p_metax_module" ]; then',
+      "      if strings \"$p2p_metax_module\" 2>/dev/null | grep -Eq '^dma_buf_(fd|get|put)$'; then p2p_kmd_dmabuf=yes; else p2p_kmd_dmabuf=no; fi",
+      '    fi',
+      '  fi',
+      'fi',
+      'p2p_kernel_dmabuf=unknown',
+      'p2p_rdma_dmabuf=unknown',
+      'p2p_peer_symbols=unknown',
+      'if [ -r /proc/kallsyms ]; then',
+      '  if grep -qw dma_buf_export /proc/kallsyms 2>/dev/null; then p2p_kernel_dmabuf=yes; else p2p_kernel_dmabuf=no; fi',
+      "  if grep -Eq '[[:space:]]ib_umem_dmabuf_get(_pinned)?([[:space:]]|$)' /proc/kallsyms 2>/dev/null; then p2p_rdma_dmabuf=yes; else p2p_rdma_dmabuf=no; fi",
+      '  if grep -qw ib_register_peer_memory_client /proc/kallsyms 2>/dev/null && grep -qw ib_unregister_peer_memory_client /proc/kallsyms 2>/dev/null; then p2p_peer_symbols=yes; else p2p_peer_symbols=no; fi',
+      'fi',
+      'p2p_ibverbs_dmabuf=unknown',
+      "p2p_ibverbs_path=\"$(ldconfig -p 2>/dev/null | awk '/libibverbs\\.so\\.1/{print $NF; exit}')\"",
+      'if [ -n "$p2p_ibverbs_path" ] && [ -r "$p2p_ibverbs_path" ]; then',
+      '  if command -v nm >/dev/null 2>&1; then',
+      '    if nm -D "$p2p_ibverbs_path" 2>/dev/null | grep -qw ibv_reg_dmabuf_mr; then p2p_ibverbs_dmabuf=yes; else p2p_ibverbs_dmabuf=no; fi',
+      '  elif command -v strings >/dev/null 2>&1; then',
+      '    if strings "$p2p_ibverbs_path" 2>/dev/null | grep -qw ibv_reg_dmabuf_mr; then p2p_ibverbs_dmabuf=yes; else p2p_ibverbs_dmabuf=no; fi',
+      '  fi',
+      'fi',
+      'if "$ib_write" --help 2>&1 | grep -q -- "--use_maca_dmabuf"; then p2p_perftest_dmabuf=yes; else p2p_perftest_dmabuf=no; fi',
+      'p2p_gdr_mode=',
+      'if [ "$p2p_peer_mem" = 1 ]; then',
+      '  p2p_gdr_mode=peermem',
+      'elif [ "$p2p_peer_mem" = 0 ]; then',
+      '  p2p_gdr_mode=dmabuf',
+      'elif [ "$p2p_gdr_hint" = dmabuf ] || [ "$p2p_gdr_hint" = peermem ]; then',
+      '  p2p_gdr_mode=$p2p_gdr_hint',
+      'elif [ "$p2p_kmd_dmabuf" = yes ] && [ "$p2p_kernel_dmabuf" = yes ] && [ "$p2p_rdma_dmabuf" = yes ] && [ "$p2p_ibverbs_dmabuf" = yes ] && [ "$p2p_perftest_dmabuf" = yes ]; then',
+      '  p2p_gdr_mode=dmabuf',
+      'elif [ "$p2p_peer_symbols" = yes ]; then',
+      '  p2p_gdr_mode=peermem',
+      'fi',
+      'if [ -z "$p2p_gdr_mode" ]; then',
+      '  printf "无法判定 GDR 显存注册方式（peer_mem=%s，KMD/内核/RDMA/libibverbs/perftest DMA-BUF=%s/%s/%s/%s/%s）。请先重新采集环境。\\n" "$p2p_peer_mem" "$p2p_kmd_dmabuf" "$p2p_kernel_dmabuf" "$p2p_rdma_dmabuf" "$p2p_ibverbs_dmabuf" "$p2p_perftest_dmabuf" >&2',
+      '  exit 2',
+      'fi',
+      'p2p_memory_args=()',
+      'if [ "$p2p_gdr_mode" = dmabuf ]; then',
+      '  if [ "$p2p_perftest_dmabuf" != yes ]; then printf "当前 ib_write_bw 不支持 --use_maca_dmabuf，无法使用 DMA-BUF。\\n" >&2; exit 2; fi',
+      '  if [ "$p2p_kmd_dmabuf" = no ] || [ "$p2p_kernel_dmabuf" = no ] || [ "$p2p_rdma_dmabuf" = no ] || [ "$p2p_ibverbs_dmabuf" = no ]; then',
+      '    printf "DMA-BUF 链路不完整（KMD/内核/RDMA/libibverbs=%s/%s/%s/%s）。\\n" "$p2p_kmd_dmabuf" "$p2p_kernel_dmabuf" "$p2p_rdma_dmabuf" "$p2p_ibverbs_dmabuf" >&2',
+      '    exit 2',
+      '  fi',
+      '  p2p_memory_args=(--use_maca_dmabuf)',
+      '  printf "GDR 显存注册方式：DMA-BUF（peer_mem=%s），命令末尾追加 --use_maca_dmabuf。\\n" "$p2p_peer_mem"',
+      'else',
+      '  printf "GDR 显存注册方式：PEERMEM（peer_mem=%s），不添加 --use_maca_dmabuf。\\n" "$p2p_peer_mem"',
+      'fi',
+      `p2p_port=${p2pPort}`,
+      'p2p_server_log="$(mktemp)"',
+      'p2p_server_pid=',
+      'p2p_stop_server() {',
+      '  [ -n "$p2p_server_pid" ] || return 0',
+      '  if kill -0 "$p2p_server_pid" 2>/dev/null; then',
+      '    kill -TERM "$p2p_server_pid" 2>/dev/null || true',
+      '    p2p_wait=0',
+      '    while kill -0 "$p2p_server_pid" 2>/dev/null && [ "$p2p_wait" -lt 15 ]; do sleep 0.1; p2p_wait=$((p2p_wait + 1)); done',
+      '    if kill -0 "$p2p_server_pid" 2>/dev/null; then kill -KILL "$p2p_server_pid" 2>/dev/null || true; fi',
+      '  fi',
+      '}',
+      'p2p_cleanup() {',
+      '  trap - EXIT HUP INT TERM',
+      '  p2p_stop_server',
+      '  [ -z "$p2p_server_pid" ] || wait "$p2p_server_pid" 2>/dev/null || true',
+      '  rm -f "$p2p_server_log"',
+      '}',
+      "trap 'p2p_cleanup' EXIT",
+      "trap 'p2p_cleanup; exit 143' HUP INT TERM",
+      `printf '启动本机 P2P 服务端：GPU ${gpus[0]} ↔ ${nics[0]}，端口 %s\\n' "$p2p_port"`,
+      `"$ib_write" -a${mxrdmaOptions} -d ${nics[0]} --use_maca=${gpus[0]}${gidOption} -p "$p2p_port" "\${p2p_memory_args[@]}" >"$p2p_server_log" 2>&1 &`,
+      'p2p_server_pid=$!',
+      'sleep 1',
+      'if ! kill -0 "$p2p_server_pid" 2>/dev/null; then',
+      '  set +e; wait "$p2p_server_pid"; p2p_server_status=$?; set -e',
+      '  [ "$p2p_server_status" -ne 0 ] || p2p_server_status=1',
+      "  printf '%s\\n' '--- P2P 服务端日志 ---'; cat \"$p2p_server_log\"",
+      '  printf "P2P 服务端启动失败（退出码 %s）。\\n" "$p2p_server_status" >&2',
+      '  exit "$p2p_server_status"',
+      'fi',
+      `printf '启动本机 P2P 客户端：GPU ${gpus[1]} ↔ ${nics[1]}，连接 localhost:%s\\n' "$p2p_port"`,
+      'set +e',
+      `"$ib_write" -a${mxrdmaOptions} -d ${nics[1]} --use_maca=${gpus[1]}${gidOption} -p "$p2p_port" localhost "\${p2p_memory_args[@]}"`,
+      'p2p_client_status=$?',
+      'if [ "$p2p_client_status" -ne 0 ]; then p2p_stop_server; fi',
+      'wait "$p2p_server_pid"',
+      'p2p_server_status=$?',
+      'set -e',
+      "printf '%s\\n' '--- P2P 服务端日志 ---'; cat \"$p2p_server_log\"",
+      'p2p_server_pid=',
+      'rm -f "$p2p_server_log"',
+      'trap - EXIT HUP INT TERM',
+      'if [ "$p2p_client_status" -ne 0 ] || [ "$p2p_server_status" -ne 0 ]; then',
+      '  printf "P2P 测试失败：server=%s, client=%s。\\n" "$p2p_server_status" "$p2p_client_status" >&2',
+      '  exit 1',
+      'fi',
+      'printf "P2P localhost 双端测试通过。\\n"'
     );
   } else if (testId === 'nic-alltoall') {
-    timeoutMs = 240_000;
-    preview = `mpirun -n 2 -host 127.0.0.1:1,${peer}:1 TransferBenchMaca ib`;
+    timeoutMs = 300_000;
+    const selectedGpuCsv = gpus.join(',');
+    const selectedNicCsv = nics.join(',');
+    const gidEnvironment = transport === 'RoCE' ? ` MCCL_IB_GID_INDEX=${gidIndex}` : '';
+    preview = `MACA_VISIBLE_DEVICES=${selectedGpuCsv} MCCL_IB_HCA=${selectedNicCsv}${gidEnvironment} MCCL_IB_DISABLE=0 MCCL_NET_DISABLE_INTRA=0 MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1 ${MACA_MPIRUN_PATH} -n ${gpus.length} ${MCCL_ALLTOALL_PATH}`;
     lines.push(
-      'mpi="$(first_exec /opt/maca/ompi/bin/mpirun /usr/bin/mpirun)"',
-      'transfer="$(first_exec /opt/maca/tools/communication/p2p/TransferBenchMaca /opt/maca/samples/mccl_tests/benchmark/TransferBenchMaca)"',
-      'ib_exec_path=/opt/maca/tools/communication/rdma/perftest/tests',
-      '[ -x "$ib_exec_path/ib_write_bw" ] || ib_exec_path=/opt/maca/samples/mccl_tests/ib_perf/tests',
-      `export IB_PORT=${nic} IB_EXE_PATH="$ib_exec_path" IB_EXE_NAME=ib_write_bw IB_TEST_MODE=1 HOST_NAME="127.0.0.1:1,${peer}:1"`,
-      `exec "$mpi" --allow-run-as-root -n 2 -host "127.0.0.1:1,${peer}:1" -mca pml ^ucx -mca osc ^ucx -mca btl ^openib -x LD_LIBRARY_PATH -x IB_PORT -x IB_EXE_PATH -x IB_EXE_NAME -x IB_TEST_MODE -x HOST_NAME "$transfer" ib`
+      `mpi=${shellSingleQuote(MACA_MPIRUN_PATH)}`,
+      `perf=${shellSingleQuote(MCCL_ALLTOALL_PATH)}`,
+      '[ -x "$mpi" ] || { printf "缺少测试程序：%s\\n" "$mpi" >&2; exit 127; }',
+      '[ -x "$perf" ] || { printf "缺少测试程序：%s\\n" "$perf" >&2; exit 127; }',
+      `export MACA_VISIBLE_DEVICES=${selectedGpuCsv} MCCL_IB_HCA=${selectedNicCsv}`,
+      transport === 'RoCE' ? `export MCCL_IB_GID_INDEX=${gidIndex}` : 'unset MCCL_IB_GID_INDEX',
+      'export MCCL_IB_DISABLE=0 MCCL_NET_DISABLE_INTRA=0 MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1',
+      'unset MCCL_NET_GDR_LEVEL',
+      'if [ "$(id -u)" -eq 0 ]; then export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1; fi',
+      'printf "通信通路：RDMA HCA（IB/RoCE）；已禁用 PCIe/MetaXLink P2P 与 SHM。\\n"',
+      `exec "$mpi" -n ${gpus.length} "$perf"`
     );
   } else if (testId === 'host-ibrc') {
     timeoutMs = 300_000;
@@ -1095,7 +1394,7 @@ function testRecipe(payload) {
       'mpi="$(first_exec /opt/maca/ompi/bin/mpirun /usr/bin/mpirun)"',
       'perf="$(first_exec /opt/maca/tools/communication/mccl/mccl_perf/alltoall_perf /opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf)"',
       `export MCCL_IB_HCA=${nic} MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1 MCCL_NET_GDR_LEVEL=SYS`,
-      `exec "$mpi" --allow-run-as-root -n ${gpuCount} -mca pml ^ucx -mca osc ^ucx -mca btl ^openib -x LD_LIBRARY_PATH -x MCCL_IB_HCA -x MCCL_P2P_LEVEL -x MCCL_SHM_DISABLE -x MCCL_NET_GDR_LEVEL "$perf" -b 1M -e 256M -f 2 -g 1 -n 5`
+      `exec "$mpi" --allow-run-as-root -n ${gpuCount} -mca pml ^ucx -mca osc ^ucx -mca btl ^openib -x METAX_INSPECTION_RUN_ID -x LD_LIBRARY_PATH -x MCCL_IB_HCA -x MCCL_P2P_LEVEL -x MCCL_SHM_DISABLE -x MCCL_NET_GDR_LEVEL "$perf" -b 1M -e 256M -f 2 -g 1 -n 5`
     );
   } else if (testId === 'host-ibgda') {
     timeoutMs = 300_000;
@@ -1111,7 +1410,46 @@ function testRecipe(payload) {
     );
   }
   lines.push('printf "结束时间：%s\\n" "$(date -Is)"');
-  return { testId, label: TEST_LABELS.get(testId), script: `${lines.join('\n')}\n`, preview, timeoutMs };
+  preview = `${MACA_LIBRARY_PATH_PREVIEW}\n${preview}`;
+  let script = `${lines.join('\n')}\n`;
+  let execution = { kind:'host' };
+  if (containerRuntime && containerId) {
+    execution = { kind:'container', runtime:containerRuntime, id:containerId.toLowerCase() };
+    script = [
+      'set -e',
+      `container_runtime=${shellSingleQuote(execution.runtime)}`,
+      `container_id=${shellSingleQuote(execution.id)}`,
+      'command -v "$container_runtime" >/dev/null 2>&1 || { printf "未安装容器运行时：%s\\n" "$container_runtime" >&2; exit 127; }',
+      'container_state="$("$container_runtime" inspect -f \'{{.State.Running}}\' "$container_id" 2>/dev/null || true)"',
+      '[ "$container_state" = "true" ] || { printf "容器不存在、未运行或当前用户无访问权限：%s\\n" "$container_id" >&2; exit 4; }',
+      'printf "运行环境：%s 容器 %s\\n" "$container_runtime" "$container_id"',
+      'exec "$container_runtime" exec -i -e "METAX_INSPECTION_RUN_ID=$METAX_INSPECTION_RUN_ID" "$container_id" bash -s <<\'__METAX_CONTAINER_TEST__\'',
+      script.trimEnd(),
+      '__METAX_CONTAINER_TEST__'
+    ].join('\n') + '\n';
+    preview = `${execution.runtime} exec -i ${execution.id.slice(0, 12)} bash -s · ${preview}`;
+  } else if (imageRuntime && imageId) {
+    const containerName = `metax-test-${testId}-${runId}`;
+    execution = { kind:'image', runtime:imageRuntime, id:imageId.toLowerCase(), containerName };
+    script = [
+      'set -e',
+      `image_runtime=${shellSingleQuote(execution.runtime)}`,
+      `image_id=${shellSingleQuote(execution.id)}`,
+      'command -v "$image_runtime" >/dev/null 2>&1 || { printf "未安装容器运行时：%s\\n" "$image_runtime" >&2; exit 127; }',
+      '"$image_runtime" image inspect "$image_id" >/dev/null 2>&1 || { printf "本地镜像不存在或当前用户无访问权限：%s\\n" "$image_id" >&2; exit 4; }',
+      `test_container_name=${shellSingleQuote(containerName)}`,
+      'run_args=(run --rm -i --name "$test_container_name" --env "METAX_INSPECTION_RUN_ID=$METAX_INSPECTION_RUN_ID" --network=host --uts=host --ipc=host --privileged=true --security-opt seccomp=unconfined --security-opt apparmor=unconfined --shm-size=100gb --ulimit memlock=-1)',
+      'for device in /dev/dri /dev/mxcd /dev/infiniband; do if [ -e "$device" ]; then run_args+=(--device="$device"); else printf "提示：宿主机未发现 %s，已跳过映射。\\n" "$device"; fi; done',
+      'video_gid="$(getent group video 2>/dev/null | cut -d: -f3)"',
+      '[ -z "$video_gid" ] || run_args+=(--group-add "$video_gid")',
+      'printf "运行环境：由本地镜像 %s 启动临时容器 %s（测试结束自动删除）\\n" "$image_id" "$test_container_name"',
+      'exec "$image_runtime" "${run_args[@]}" "$image_id" bash -s <<\'__METAX_IMAGE_TEST__\'',
+      script.trimEnd(),
+      '__METAX_IMAGE_TEST__'
+    ].join('\n') + '\n';
+    preview = `${execution.runtime} run --rm -i [GPU/RDMA/host namespaces/privileged] ${execution.id.slice(0, 19)} bash -s · ${preview}`;
+  }
+  return { testId, label: TEST_LABELS.get(testId), script, preview, timeoutMs, execution, runId };
 }
 
 function shellSingleQuote(value) {
@@ -1163,32 +1501,36 @@ function singleEpRequest(payload) {
   return { testType, typeLabel:SINGLE_EP_TYPE_LABELS[testType], ranks, tokens, hidden, cases };
 }
 
-function singleEpCaseRecipe(config, testCase) {
-  let launcher;
+function singleEpCaseRecipe(config, testCase, runtimeTestDir = SINGLE_EP_TEST_DIR) {
+  const program = SINGLE_EP_RUNTIME_PROGRAMS[config.testType];
+  if (!program) throw new Error('不支持该 SingleEP 测试类型。');
+  const launcher = program.launcher;
   let args;
   if (config.testType === 'low-latency') {
-    launcher = 'run.sh';
     args = [
       String(testCase.rank), '--', '--num-tokens', String(testCase.tokens),
       '--hidden', String(testCase.hidden), '--warmup', '20', '--tests', '30'
     ];
   } else if (config.testType === 'intranode') {
-    launcher = 'run_intranode.sh';
     args = [
       String(testCase.rank), '--', '--num-tokens', String(testCase.tokens),
       '--hidden', String(testCase.hidden)
     ];
   } else {
-    launcher = 'run_internode.sh';
     args = ['--', '--num-tokens', String(testCase.tokens), '--hidden', String(testCase.hidden)];
   }
+  const testDir = path.resolve(runtimeTestDir);
+  const testRoot = path.dirname(testDir);
   const printableArgs = args.join(' ');
-  const preview = 'bash ' + SINGLE_EP_TEST_DIR + '/' + launcher + ' ' + printableArgs;
+  const preview = MACA_LIBRARY_PATH_PREVIEW + '\n' + 'bash ' + testDir + '/' + launcher + ' ' + printableArgs;
   const lines = [
     'set -e',
     'export LC_ALL=C',
-    'test_dir=' + shellSingleQuote(SINGLE_EP_TEST_DIR),
+    'test_dir=' + shellSingleQuote(testDir),
+    'test_root=' + shellSingleQuote(testRoot),
+    'export LD_LIBRARY_PATH="/opt/maca/lib:$test_root:${LD_LIBRARY_PATH:-}"',
     '[ -r "$test_dir/' + launcher + '" ] || { printf "SingleEP 启动器不存在或不可读：%s\\n" "$test_dir/' + launcher + '" >&2; exit 127; }',
+    '[ -x "$test_dir/' + program.executable + '" ] || { printf "SingleEP 测试程序不存在或不可执行：%s\\n" "$test_dir/' + program.executable + '" >&2; exit 127; }',
     'printf "=== SingleEP ' + config.typeLabel + ' | ranks=' + testCase.rank + ' tokens=' + testCase.tokens + ' hidden=' + testCase.hidden + ' ===\\n"',
     'exec bash "$test_dir/' + launcher + '" ' + printableArgs
   ];
@@ -1199,6 +1541,246 @@ function singleEpCaseRecipe(config, testCase) {
     preview,
     timeoutMs:SINGLE_EP_CASE_TIMEOUT_MS
   };
+}
+
+function singleEpRuntimeBundle(config, requestedRunId) {
+  const runId = validTestRunId(requestedRunId);
+  const program = SINGLE_EP_RUNTIME_PROGRAMS[config.testType];
+  if (!program) throw new Error('不支持该 SingleEP 测试类型。');
+  const sourceRoot = path.dirname(path.resolve(SINGLE_EP_TEST_DIR));
+  const assets = [
+    'singleep.so',
+    'third_party/mxshmem/lib/libmxshmem_host.so',
+    `test/${program.launcher}`,
+    `test/${program.executable}`
+  ];
+  for (const asset of assets) {
+    const source = path.join(sourceRoot, asset);
+    try { fs.accessSync(source, fs.constants.R_OK); }
+    catch { throw new Error(`巡检平台缺少 SingleEP 运行文件：${source}`); }
+  }
+  const stageDir = `/tmp/metax-singleep-${runId}`;
+  const uploadDir = `${stageDir}.upload`;
+  const remoteScript = [
+    'set -e',
+    'umask 077',
+    `stage_dir=${shellSingleQuote(stageDir)}`,
+    `upload_dir=${shellSingleQuote(uploadDir)}`,
+    'cleanup_upload() { rm -rf -- "$upload_dir"; }',
+    "trap 'cleanup_upload' EXIT HUP INT TERM",
+    'rm -rf -- "$upload_dir"',
+    'mkdir -p -- "$upload_dir"',
+    'tar -xzf - -C "$upload_dir"',
+    `[ -r "$upload_dir/singleep.so" ] || { echo "SingleEP 运行包缺少 singleep.so。" >&2; exit 127; }`,
+    `[ -r "$upload_dir/third_party/mxshmem/lib/libmxshmem_host.so" ] || { echo "SingleEP 运行包缺少 libmxshmem_host.so。" >&2; exit 127; }`,
+    `[ -r "$upload_dir/test/${program.launcher}" ] || { echo "SingleEP 运行包缺少 ${program.launcher}。" >&2; exit 127; }`,
+    `[ -x "$upload_dir/test/${program.executable}" ] || { echo "SingleEP 运行包缺少可执行文件 ${program.executable}。" >&2; exit 127; }`,
+    'rm -rf -- "$stage_dir"',
+    'mv -- "$upload_dir" "$stage_dir"',
+    'trap - EXIT HUP INT TERM'
+  ].join('\n');
+  return { sourceRoot, assets, stageDir, testDir:`${stageDir}/test`, remoteScript };
+}
+
+function prepareSingleEpRuntime(config, target, batch, res) {
+  const normalized = normalizeTestTarget(target);
+  if (normalized.kind !== 'remote') return Promise.resolve({ ready:true, testDir:path.resolve(SINGLE_EP_TEST_DIR), stageDir:'' });
+  const bundle = singleEpRuntimeBundle(config, batch.runId);
+  batch.runtimeStageDir = bundle.stageDir;
+  sendStreamEvent(res, {
+    type:'output', stream:'stdout',
+    text:`[准备] 正在将 SingleEP ${config.typeLabel} 运行包传输到远端临时目录 ${bundle.stageDir}…\n`
+  });
+  return new Promise((resolve, reject) => {
+    const launch = remoteSshCommandLaunch(normalized, `bash -c ${shellSingleQuote(bundle.remoteScript)}`);
+    let remote;
+    let archive;
+    try {
+      remote = spawn(launch.command, launch.args, {
+        detached:true,
+        stdio:launch.fdPassword ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe']
+      });
+      archive = spawn('tar', ['-C', bundle.sourceRoot, '-czf', '-', ...bundle.assets], {
+        detached:true,
+        stdio:['ignore', 'pipe', 'pipe']
+      });
+    } catch (error) {
+      terminateProcessGroup(remote);
+      terminateProcessGroup(archive);
+      return reject(error);
+    }
+    batch.child = remote;
+    let remoteDone = false;
+    let archiveDone = false;
+    let remoteCode = null;
+    let archiveCode = null;
+    let remoteSignal = null;
+    let archiveSignal = null;
+    let remoteError = '';
+    let archiveError = '';
+    let terminalError = null;
+    let settled = false;
+    let timeout;
+    let stopPromise = null;
+    const appendLimited = (current, chunk) => current.length >= 65_536
+      ? current
+      : (current + chunk.toString('utf8')).slice(0, 65_536);
+    const stageError = () => {
+      const detail = [archiveError.trim(), remoteError.trim()].filter(Boolean).join('；');
+      if (terminalError) return detail ? `${terminalError.message}：${detail}` : terminalError.message;
+      if (archiveCode !== 0) return `生成 SingleEP 运行包失败（退出码 ${archiveCode ?? archiveSignal ?? '未知'}）${detail ? `：${detail}` : ''}`;
+      return `传输 SingleEP 运行包失败（退出码 ${remoteCode ?? remoteSignal ?? '未知'}）${detail ? `：${detail}` : ''}`;
+    };
+    const finish = (forced = false) => {
+      if (settled || (!forced && (!remoteDone || !archiveDone))) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (batch.child === remote) batch.child = null;
+      if (batch.stopCurrent === stopStage) batch.stopCurrent = null;
+      const success = !terminalError && remoteCode === 0 && archiveCode === 0;
+      if (success) {
+        sendStreamEvent(res, { type:'output', stream:'stdout', text:`[准备] SingleEP 运行包已就绪。\n` });
+        resolve({ ready:true, testDir:bundle.testDir, stageDir:bundle.stageDir });
+      } else if (batch.cancelled) {
+        resolve({ ready:false, testDir:bundle.testDir, stageDir:bundle.stageDir });
+      } else {
+        reject(new Error(stageError()));
+      }
+    };
+    function stopStage(message = 'SingleEP 运行包传输已停止。') {
+      if (stopPromise) return stopPromise;
+      if (!terminalError) terminalError = new Error(message);
+      stopPromise = (async () => {
+        terminateProcessGroup(archive);
+        terminateProcessGroup(remote);
+        let [archiveExited, remoteExited] = await Promise.all([
+          waitForProcessClose(archive, TEST_STOP_GRACE_MS),
+          waitForProcessClose(remote, TEST_STOP_GRACE_MS)
+        ]);
+        if (!archiveExited) terminateProcessGroup(archive, 'SIGKILL');
+        if (!remoteExited) terminateProcessGroup(remote, 'SIGKILL');
+        if (!archiveExited || !remoteExited) {
+          [archiveExited, remoteExited] = await Promise.all([
+            waitForProcessClose(archive, 2_000),
+            waitForProcessClose(remote, 2_000)
+          ]);
+        }
+        if (archiveExited) {
+          archiveDone = true;
+          archiveCode ??= archive.exitCode;
+          archiveSignal ??= archive.signalCode;
+        }
+        if (remoteExited) {
+          remoteDone = true;
+          remoteCode ??= remote.exitCode;
+          remoteSignal ??= remote.signalCode;
+        }
+        // close 通常会自然触发 finish；这里强制收口，避免异常子进程只报 error/exit 时批次一直等待。
+        finish(true);
+        return {
+          confirmed:archiveExited && remoteExited,
+          error:archiveExited && remoteExited ? '' : '无法确认 SingleEP 运行包传输进程已完全退出。'
+        };
+      })();
+      return stopPromise;
+    }
+    batch.stopCurrent = stopStage;
+    remote.stdout.on('data', () => {});
+    remote.stderr.on('data', (chunk) => { remoteError = appendLimited(remoteError, chunk); });
+    archive.stderr.on('data', (chunk) => { archiveError = appendLimited(archiveError, chunk); });
+    remote.stdin.on('error', (error) => { if (!settled) void stopStage(error.message); });
+    archive.stdout.on('error', (error) => { if (!settled) void stopStage(error.message); });
+    remote.on('error', (error) => {
+      if (!terminalError) terminalError = error;
+      void stopStage(error.message);
+    });
+    archive.on('error', (error) => {
+      if (!terminalError) terminalError = error;
+      void stopStage(error.message);
+    });
+    remote.on('close', (code, signal) => {
+      remoteDone = true;
+      remoteCode = code;
+      remoteSignal = signal;
+      if (code !== 0) terminateProcessGroup(archive);
+      finish();
+    });
+    archive.on('close', (code, signal) => {
+      archiveDone = true;
+      archiveCode = code;
+      archiveSignal = signal;
+      if (code !== 0) terminateProcessGroup(remote);
+      finish();
+    });
+    if (launch.fdPassword) {
+      remote.stdio[3].on('error', () => {});
+      remote.stdio[3].end(`${launch.fdPassword}\n`);
+    }
+    archive.stdout.pipe(remote.stdin);
+    timeout = setTimeout(() => { void stopStage(`SingleEP 运行包传输超过 ${SINGLE_EP_STAGE_TIMEOUT_MS / 1000} 秒，已停止。`); }, SINGLE_EP_STAGE_TIMEOUT_MS);
+    timeout.unref?.();
+  });
+}
+
+function runTargetMaintenanceScript(target, script, timeoutMs = TEST_CLEANUP_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let launch;
+    try { launch = rawTestLaunch(target, script); }
+    catch (error) { return resolve({ success:false, error:errorMessage(error) }); }
+    const hasPasswordFd = Boolean(launch.fdPassword);
+    let child;
+    try {
+      child = spawn(launch.command, launch.args, {
+        detached:true,
+        stdio:hasPasswordFd ? ['pipe', 'ignore', 'pipe', 'pipe'] : ['pipe', 'ignore', 'pipe']
+      });
+    } catch (error) {
+      return resolve({ success:false, error:errorMessage(error) });
+    }
+    let settled = false;
+    let stderr = '';
+    let timeout;
+    let forceTimer;
+    const finish = (success, error = '') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      clearTimeout(forceTimer);
+      resolve({ success, error:error || stderr.trim() });
+    };
+    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString('utf8')).slice(0, 32_768); });
+    child.stdin.on('error', () => {});
+    child.on('error', (error) => finish(false, error.message));
+    child.on('close', (code, signal) => finish(code === 0, code === 0 ? '' : `退出码 ${code ?? signal ?? '未知'}`));
+    if (hasPasswordFd) {
+      child.stdio[3].on('error', () => {});
+      child.stdio[3].end(`${launch.fdPassword}\n`);
+    }
+    child.stdin.end(launch.input);
+    timeout = setTimeout(() => {
+      terminateProcessGroup(child);
+      forceTimer = setTimeout(() => {
+        terminateProcessGroup(child, 'SIGKILL');
+        finish(false, `命令执行超过 ${timeoutMs / 1000} 秒。`);
+      }, 500);
+      forceTimer.unref?.();
+    }, timeoutMs);
+    timeout.unref?.();
+  });
+}
+
+function cleanupSingleEpRuntime(target, stageDir) {
+  if (!stageDir) return Promise.resolve({ success:true, error:'' });
+  if (!/^\/tmp\/metax-singleep-[a-f0-9]{24}$/.test(stageDir)) {
+    return Promise.resolve({ success:false, error:'SingleEP 临时目录格式无效，未执行清理。' });
+  }
+  const script = [
+    'set -e',
+    `stage_dir=${shellSingleQuote(stageDir)}`,
+    'case "$stage_dir" in /tmp/metax-singleep-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;; *) exit 64 ;; esac',
+    'rm -rf -- "$stage_dir" "${stage_dir}.upload"'
+  ].join('\n') + '\n';
+  return runTargetMaintenanceScript(target, script);
 }
 
 function finiteMetric(value) {
@@ -1263,10 +1845,10 @@ function singleEpFailureMessage(launch, code, signal, parsed) {
   return '进程退出码 ' + (code ?? '-') + (signal ? '，信号 ' + signal : '');
 }
 
-function executeSingleEpCase(config, testCase, target, position, total, res, batch) {
+function executeSingleEpCase(config, testCase, target, runtimeTestDir, position, total, res, batch) {
   return new Promise((resolve) => {
-    const recipe = singleEpCaseRecipe(config, testCase);
-    const launch = testLaunch(target, recipe.script);
+    const recipe = singleEpCaseRecipe(config, testCase, runtimeTestDir);
+    const launch = testLaunch(target, recipe.script, { runId:batch.runId });
     const hasPasswordFd = Boolean(launch.fdPassword);
     const child = spawn(launch.command, launch.args, {
       detached:true,
@@ -1278,19 +1860,18 @@ function executeSingleEpCase(config, testCase, target, position, total, res, bat
     let caseOutputSize = 0;
     let terminalError = null;
     let finished = false;
-    let forceKillTimer = null;
     sendStreamEvent(res, {
       type:'case-start', index:position, total, testType:config.testType,
       typeLabel:config.typeLabel, rank:testCase.rank, tokens:testCase.tokens,
       hidden:testCase.hidden, command:recipe.preview, timeoutSeconds:recipe.timeoutMs / 1000
     });
     const stop = (error) => {
-      if (finished || terminalError) return;
-      terminalError = error;
-      terminateProcessGroup(child);
-      forceKillTimer = setTimeout(() => terminateProcessGroup(child, 'SIGKILL'), 1_500);
-      forceKillTimer.unref?.();
+      if (finished) return launch.stopPromise || Promise.resolve({ confirmed:true });
+      if (!terminalError) terminalError = error;
+      if (!launch.stopPromise) launch.stopPromise = stopLaunchedTest(launch, child);
+      return launch.stopPromise;
     };
+    batch.stopCurrent = (message) => stop(new Error(message));
     const output = (stream, chunk) => {
       if (terminalError) return;
       const text = chunk.toString('utf8');
@@ -1314,11 +1895,13 @@ function executeSingleEpCase(config, testCase, target, position, total, res, bat
     }
     child.stdin.end(launch.input);
     const timeout = setTimeout(() => stop(new Error('本轮测试超过 ' + (recipe.timeoutMs / 1000) + ' 秒，已停止。')), recipe.timeoutMs);
-    child.on('close', (code, signal) => {
+    child.on('close', async (code, signal) => {
       finished = true;
       clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
+      const cleanup = launch.stopPromise ? await launch.stopPromise : { confirmed:true };
+      if (terminalError && !cleanup.confirmed) terminalError = new Error(`${terminalError.message}；无法确认测试程序已完全退出：${cleanup.error || '清理失败'}`);
       if (batch.child === child) batch.child = null;
+      if (batch.stopCurrent) batch.stopCurrent = null;
       const parsed = parseSingleEpOutput(config.testType, caseOutput, testCase);
       const success = !terminalError && code === 0 && parsed.passed;
       resolve({
@@ -1341,33 +1924,58 @@ async function executeSingleEpBatch(config, target, res) {
     outputSize:0,
     fatalError:null,
     cancelled:false,
-    cancelKillTimer:null
+    runId:createTestRunId(),
+    stopKind:'',
+    stopCurrent:null,
+    stopPromise:null,
+    cleanupConfirmed:true,
+    runtimeTestDir:path.resolve(SINGLE_EP_TEST_DIR),
+    runtimeStageDir:''
+  };
+  batch.requestStop = (message = '用户请求停止测试。', kind = 'user') => {
+    if (kind === 'user') batch.stopKind = 'user';
+    else if (!batch.stopKind) batch.stopKind = kind;
+    batch.cancelled = true;
+    if (!batch.stopPromise) {
+      batch.stopPromise = batch.stopCurrent
+        ? batch.stopCurrent(message).then((result) => { batch.cleanupConfirmed = result.confirmed; return result; })
+        : Promise.resolve({ confirmed:true });
+    }
+    return batch.stopPromise;
   };
   activePerformanceTest = batch;
   const results = [];
   const onClose = () => {
     if (res.writableEnded) return;
-    batch.cancelled = true;
-    if (batch.child) {
-      terminateProcessGroup(batch.child);
-      batch.cancelKillTimer = setTimeout(() => terminateProcessGroup(batch.child, 'SIGKILL'), 1_500);
-      batch.cancelKillTimer.unref?.();
-    }
+    void batch.requestStop('浏览器已断开，测试任务已停止。', 'disconnect');
   };
   res.on('close', onClose);
   sendStreamEvent(res, {
-    type:'start', testId:'singleep', label:batch.label, testType:config.testType,
+    type:'start', testId:'singleep', label:batch.label, runId:batch.runId, testType:config.testType,
     typeLabel:config.typeLabel, total:config.cases.length,
     timeoutSeconds:SINGLE_EP_CASE_TIMEOUT_MS / 1000
   });
   try {
+    const runtime = await prepareSingleEpRuntime(config, target, batch, res);
+    batch.runtimeTestDir = runtime.testDir;
     for (let index = 0; index < config.cases.length; index += 1) {
       if (batch.cancelled || batch.fatalError) break;
-      const result = await executeSingleEpCase(config, config.cases[index], target, index + 1, config.cases.length, res, batch);
+      const result = await executeSingleEpCase(config, config.cases[index], target, batch.runtimeTestDir, index + 1, config.cases.length, res, batch);
       results.push(result);
       if (!batch.cancelled) sendStreamEvent(res, { type:'case-result', result });
     }
-    if (!batch.cancelled) {
+    if (batch.cancelled) {
+      if (batch.stopPromise) await batch.stopPromise;
+      const passed = results.filter((result) => result.success).length;
+      sendStreamEvent(res, {
+        type:'result', success:false, stopped:batch.stopKind === 'user', cleanupConfirmed:batch.cleanupConfirmed,
+        total:config.cases.length, completed:results.length, passed, failed:results.length - passed,
+        durationMs:Date.now() - batch.startedAt,
+        error:batch.cleanupConfirmed ? '测试已停止，测试程序已确认退出。' : '停止已执行，但无法确认测试程序已完全退出。',
+        results
+      });
+      if (!res.writableEnded) res.end();
+    } else {
       const passed = results.filter((result) => result.success).length;
       const failed = results.length - passed;
       sendStreamEvent(res, {
@@ -1395,40 +2003,293 @@ async function executeSingleEpBatch(config, target, res) {
     }
   } finally {
     res.off('close', onClose);
-    if (batch.cancelKillTimer) clearTimeout(batch.cancelKillTimer);
+    if (batch.stopPromise) await batch.stopPromise;
+    const runtimeCleanup = await cleanupSingleEpRuntime(target, batch.runtimeStageDir);
+    if (!runtimeCleanup.success) console.warn(`SingleEP 远端临时目录清理失败：${runtimeCleanup.error}`);
     if (activePerformanceTest === batch) activePerformanceTest = null;
   }
 }
 
-function testLaunch(target, script) {
+function normalizeTestTarget(target) {
   if (!target || typeof target !== 'object' || Array.isArray(target)) throw new Error('测试目标格式无效。');
   if (!['local', 'remote'].includes(target.kind)) throw new Error('测试目标类型无效。');
   const password = typeof target.password === 'string' ? target.password : '';
   if (password.length > 512 || /[\r\n\0]/.test(password)) throw new Error('密码格式无效。');
-  if (target.kind !== 'remote') return { command: 'bash', args: ['-s'], input: script, fdPassword: '' };
+  if (target.kind !== 'remote') return { kind:'local', password:'' };
   if (!/^[a-zA-Z0-9][a-zA-Z0-9.:-]*$/.test(target.host || '')) throw new Error('远程地址格式无效。');
   if (target.user && !/^[a-z_][a-z0-9_-]*$/i.test(target.user)) throw new Error('SSH 用户名格式无效。');
   const port = Number(target.port) || 22;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SSH 端口必须在 1 到 65535 之间。');
   if (target.identityFile && (typeof target.identityFile !== 'string' || target.identityFile.length > 1024 || /[\r\n\0]/.test(target.identityFile))) throw new Error('私钥路径格式无效。');
+  return {
+    kind:'remote', host:String(target.host), user:String(target.user || ''), port,
+    identityFile:String(target.identityFile || ''), password
+  };
+}
+
+function remoteSshCommandLaunch(normalized, remoteCommand) {
+  if (normalized.kind !== 'remote') throw new Error('SSH 命令只能用于远程测试目标。');
   const sshArgs = [
-    '-o', `BatchMode=${password ? 'no' : 'yes'}`,
+    '-o', `BatchMode=${normalized.password ? 'no' : 'yes'}`,
     '-o', 'NumberOfPasswordPrompts=1',
     '-o', 'StrictHostKeyChecking=accept-new',
     '-o', 'ConnectTimeout=8',
-    '-p', String(port)
+    '-p', String(normalized.port)
   ];
-  if (target.identityFile) sshArgs.push('-i', target.identityFile);
-  sshArgs.push(`${target.user ? `${target.user}@` : ''}${target.host}`, 'bash -s');
-  return password
-    ? { command: 'sshpass', args: ['-d', '3', 'ssh', ...sshArgs], input: script, fdPassword: password }
-    : { command: 'ssh', args: sshArgs, input: script, fdPassword: '' };
+  if (normalized.identityFile) sshArgs.push('-i', normalized.identityFile);
+  sshArgs.push(`${normalized.user ? `${normalized.user}@` : ''}${normalized.host}`, remoteCommand);
+  return normalized.password
+    ? { command:'sshpass', args:['-d', '3', 'ssh', ...sshArgs], fdPassword:normalized.password, target:normalized }
+    : { command:'ssh', args:sshArgs, fdPassword:'', target:normalized };
+}
+
+function rawTestLaunch(target, script) {
+  const normalized = normalizeTestTarget(target);
+  if (normalized.kind !== 'remote') {
+    return { command:'bash', args:['-s'], input:script, fdPassword:'', target:normalized };
+  }
+  return { ...remoteSshCommandLaunch(normalized, 'bash -s'), input:script };
+}
+
+function taggedTestScript(script, requestedRunId) {
+  const runId = validTestRunId(requestedRunId);
+  const delimiter = `__METAX_TEST_${runId.toUpperCase()}__`;
+  return [
+    'set +e',
+    `metax_run_id=${shellSingleQuote(runId)}`,
+    'metax_run_dir="${TMPDIR:-/tmp}/metax-inspection-$metax_run_id"',
+    'umask 077',
+    'mkdir "$metax_run_dir" || { printf "无法创建测试运行目录：%s\\n" "$metax_run_dir" >&2; exit 125; }',
+    'metax_script="$metax_run_dir/test.sh"',
+    `cat > "$metax_script" <<'${delimiter}'`,
+    script.trimEnd(),
+    delimiter,
+    'chmod 700 "$metax_script"',
+    'export METAX_INSPECTION_RUN_ID="$metax_run_id"',
+    'metax_child=',
+    'metax_child_group=no',
+    'metax_local_cleanup() {',
+    '  trap - HUP INT TERM',
+    '  if [ -n "$metax_child" ] && kill -0 "$metax_child" 2>/dev/null; then',
+    '    if [ "$metax_child_group" = yes ]; then kill -TERM -- "-$metax_child" 2>/dev/null || true; else kill -TERM "$metax_child" 2>/dev/null || true; fi',
+    '    metax_wait=0',
+    '    while kill -0 "$metax_child" 2>/dev/null && [ "$metax_wait" -lt 15 ]; do sleep 0.1; metax_wait=$((metax_wait + 1)); done',
+    '    if kill -0 "$metax_child" 2>/dev/null; then',
+    '      if [ "$metax_child_group" = yes ]; then kill -KILL -- "-$metax_child" 2>/dev/null || true; else kill -KILL "$metax_child" 2>/dev/null || true; fi',
+    '    fi',
+    '  fi',
+    '  rm -f "$metax_script" "$metax_run_dir/pid" 2>/dev/null || true',
+    '  rmdir "$metax_run_dir" 2>/dev/null || true',
+    '}',
+    "trap 'metax_local_cleanup; exit 143' HUP INT TERM",
+    'if command -v setsid >/dev/null 2>&1; then',
+    '  setsid bash "$metax_script" &',
+    '  metax_child_group=yes',
+    'else',
+    '  bash "$metax_script" &',
+    'fi',
+    'metax_child=$!',
+    'printf "%s\\n" "$metax_child" > "$metax_run_dir/pid"',
+    'wait "$metax_child"',
+    'metax_status=$?',
+    'trap - HUP INT TERM',
+    'metax_local_cleanup',
+    'exit "$metax_status"'
+  ].join('\n') + '\n';
+}
+
+function taggedProcessCleanupLines(requestedRunId) {
+  const runId = validTestRunId(requestedRunId);
+  return [
+    `metax_run_id=${shellSingleQuote(runId)}`,
+    'metax_run_dir="${TMPDIR:-/tmp}/metax-inspection-$metax_run_id"',
+    'unset METAX_INSPECTION_RUN_ID',
+    'metax_pid_is_tagged() {',
+    '  metax_check_pid="$1"',
+    '  case "$metax_check_pid" in ""|*[!0-9]*) return 1 ;; esac',
+    '  [ -r "/proc/$metax_check_pid/environ" ] || return 1',
+    '  { tr \'\\0\' \'\\n\' < "/proc/$metax_check_pid/environ"; } 2>/dev/null | grep -Fqx -- "METAX_INSPECTION_RUN_ID=$metax_run_id"',
+    '}',
+    'metax_tagged_pids() {',
+    '  for metax_env in /proc/[0-9]*/environ; do',
+    '    [ -r "$metax_env" ] || continue',
+    '    if { tr \'\\0\' \'\\n\' < "$metax_env"; } 2>/dev/null | grep -Fqx -- "METAX_INSPECTION_RUN_ID=$metax_run_id"; then',
+    '      metax_pid="${metax_env#/proc/}"; metax_pid="${metax_pid%/environ}"',
+    '      case "$metax_pid" in ""|*[!0-9]*) ;; "$$"|"$PPID") ;; *) printf "%s\\n" "$metax_pid" ;; esac',
+    '    fi',
+    '  done',
+    '}',
+    'metax_stop_tagged() {',
+    '  for metax_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do',
+    '    metax_pids="$(metax_tagged_pids)"',
+    '    [ -n "$metax_pids" ] || break',
+    '    for metax_pid in $metax_pids; do metax_pid_is_tagged "$metax_pid" && kill -TERM "$metax_pid" 2>/dev/null || true; done',
+    '    sleep 0.1',
+    '  done',
+    '  if [ -n "$metax_pids" ]; then',
+    '    for metax_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do',
+    '      metax_pids="$(metax_tagged_pids)"',
+    '      [ -n "$metax_pids" ] || break',
+    '      for metax_pid in $metax_pids; do metax_pid_is_tagged "$metax_pid" && kill -KILL "$metax_pid" 2>/dev/null || true; done',
+    '      sleep 0.1',
+    '    done',
+    '  fi',
+    '  rm -f "$metax_run_dir/test.sh" "$metax_run_dir/pid" 2>/dev/null || true',
+    '  rmdir "$metax_run_dir" 2>/dev/null || true',
+    '  [ -z "$(metax_tagged_pids)" ]',
+    '}'
+  ];
+}
+
+function testCleanupScript(requestedRunId, execution = { kind:'host' }) {
+  const runId = validTestRunId(requestedRunId);
+  const lines = ['set +e', 'metax_cleanup_failed=0'];
+  if (execution.kind === 'container') {
+    const delimiter = `__METAX_CONTAINER_CLEANUP_${runId.toUpperCase()}__`;
+    lines.push(
+      `metax_runtime=${shellSingleQuote(execution.runtime)}`,
+      `metax_container=${shellSingleQuote(execution.id)}`,
+      'if ! command -v "$metax_runtime" >/dev/null 2>&1 || ! "$metax_runtime" inspect "$metax_container" >/dev/null 2>&1; then',
+      '  metax_cleanup_failed=1',
+      'else',
+      '  metax_container_running="$("$metax_runtime" inspect -f \'{{.State.Running}}\' "$metax_container" 2>/dev/null || true)"',
+      '  if [ "$metax_container_running" = true ]; then',
+      `    "$metax_runtime" exec -i "$metax_container" bash -s <<'${delimiter}'`,
+      'set +e',
+      ...taggedProcessCleanupLines(runId),
+      'metax_stop_tagged',
+      delimiter,
+      '    [ $? -eq 0 ] || metax_cleanup_failed=1',
+      '  fi',
+      'fi'
+    );
+  } else if (execution.kind === 'image') {
+    lines.push(
+      `metax_runtime=${shellSingleQuote(execution.runtime)}`,
+      `metax_container=${shellSingleQuote(execution.containerName)}`,
+      'if ! command -v "$metax_runtime" >/dev/null 2>&1; then',
+      '  metax_cleanup_failed=1',
+      'else',
+      '  for metax_container_wait in 1 2 3 4 5; do',
+      '    "$metax_runtime" rm -f "$metax_container" >/dev/null 2>&1 || true',
+      '    sleep 0.2',
+      '  done',
+      '  if "$metax_runtime" inspect "$metax_container" >/dev/null 2>&1; then metax_cleanup_failed=1; fi',
+      'fi'
+    );
+  }
+  lines.push(
+    ...taggedProcessCleanupLines(runId),
+    'metax_stop_tagged || metax_cleanup_failed=1',
+    'exit "$metax_cleanup_failed"'
+  );
+  return `${lines.join('\n')}\n`;
+}
+
+function testLaunch(target, script, { runId = createTestRunId(), execution = { kind:'host' } } = {}) {
+  const validatedRunId = validTestRunId(runId);
+  const launch = rawTestLaunch(target, taggedTestScript(script, validatedRunId));
+  return { ...launch, runId:validatedRunId, execution };
 }
 
 function terminateProcessGroup(child, signal = 'SIGTERM') {
   if (!child?.pid) return;
   try { process.kill(-child.pid, signal); }
   catch { try { child.kill(signal); } catch {} }
+}
+
+function waitForProcessClose(child, timeoutMs) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off('close', onClose);
+      resolve(value);
+    };
+    const onClose = () => done(true);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    timer.unref?.();
+    child.once('close', onClose);
+  });
+}
+
+function runTestCleanup(launch) {
+  return new Promise((resolve) => {
+    let cleanup;
+    try { cleanup = rawTestLaunch(launch.target, testCleanupScript(launch.runId, launch.execution)); }
+    catch (error) { return resolve({ success:false, error:errorMessage(error) }); }
+    const hasPasswordFd = Boolean(cleanup.fdPassword);
+    let child;
+    try {
+      child = spawn(cleanup.command, cleanup.args, {
+        detached:true,
+        stdio:hasPasswordFd ? ['pipe', 'ignore', 'pipe', 'pipe'] : ['pipe', 'ignore', 'pipe']
+      });
+    } catch (error) {
+      return resolve({ success:false, error:errorMessage(error) });
+    }
+    let settled = false;
+    let stderr = '';
+    let timeout = null;
+    let forceTimer = null;
+    const finish = (success, error = '') => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (forceTimer) clearTimeout(forceTimer);
+      resolve({ success, error:error || stderr.trim() });
+    };
+    child.stderr?.on('data', (chunk) => { if (stderr.length < 32_768) stderr += chunk.toString('utf8'); });
+    child.stdin.on('error', () => {});
+    child.on('error', (error) => finish(false, error.message));
+    child.on('close', (code, signal) => {
+      const detail = stderr.trim();
+      finish(code === 0, code === 0 ? '' : `清理命令退出码 ${code ?? signal ?? '未知'}${detail ? `：${detail}` : ''}`);
+    });
+    if (hasPasswordFd) {
+      child.stdio[3].on('error', () => {});
+      child.stdio[3].end(`${cleanup.fdPassword}\n`);
+    }
+    child.stdin.end(cleanup.input);
+    timeout = setTimeout(() => {
+      terminateProcessGroup(child);
+      forceTimer = setTimeout(() => {
+        terminateProcessGroup(child, 'SIGKILL');
+        finish(false, `停止清理超过 ${TEST_CLEANUP_TIMEOUT_MS / 1000} 秒。`);
+      }, 500);
+      forceTimer.unref?.();
+    }, TEST_CLEANUP_TIMEOUT_MS);
+    timeout.unref?.();
+  });
+}
+
+function stopLaunchedTest(launch, child) {
+  if (launch.stopPromise) return launch.stopPromise;
+  launch.stopPromise = (async () => {
+    terminateProcessGroup(child);
+    const cleanupPromise = runTestCleanup(launch);
+    let processExited = await waitForProcessClose(child, TEST_STOP_GRACE_MS);
+    if (!processExited) {
+      terminateProcessGroup(child, 'SIGKILL');
+      processExited = await waitForProcessClose(child, 2_000);
+    }
+    const cleanup = await cleanupPromise;
+    if (processExited) {
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    }
+    return {
+      confirmed:processExited && cleanup.success,
+      processExited,
+      cleanupSucceeded:cleanup.success,
+      error:cleanup.error || (!processExited ? '测试启动进程未在强制终止后退出。' : '')
+    };
+  })();
+  return launch.stopPromise;
 }
 
 function executePerformanceTest(recipe, launch, req, res) {
@@ -1439,16 +2300,18 @@ function executePerformanceTest(recipe, launch, req, res) {
     let outputSize = 0;
     let terminalError = null;
     let finished = false;
-    let forceKillTimer = null;
-    activePerformanceTest = { testId: recipe.testId, label: recipe.label, child, startedAt };
-    sendStreamEvent(res, { type: 'start', testId: recipe.testId, label: recipe.label, command: recipe.preview, timeoutSeconds: recipe.timeoutMs / 1000 });
-    const stop = (error) => {
-      if (finished || terminalError) return;
-      terminalError = error;
-      terminateProcessGroup(child);
-      forceKillTimer = setTimeout(() => terminateProcessGroup(child, 'SIGKILL'), 1_500);
-      forceKillTimer.unref?.();
+    const active = { testId:recipe.testId, label:recipe.label, child, startedAt, runId:launch.runId, stopKind:'', stopPromise:null };
+    activePerformanceTest = active;
+    sendStreamEvent(res, { type:'start', testId:recipe.testId, label:recipe.label, runId:launch.runId, command:recipe.preview, timeoutSeconds:recipe.timeoutMs / 1000 });
+    const stop = (error, kind = 'system') => {
+      if (kind === 'user') active.stopKind = 'user';
+      else if (!active.stopKind) active.stopKind = kind;
+      if (finished) return active.stopPromise || Promise.resolve({ confirmed:true });
+      if (!terminalError) terminalError = error;
+      if (!active.stopPromise) active.stopPromise = stopLaunchedTest(launch, child);
+      return active.stopPromise;
     };
+    active.requestStop = (message = '用户请求停止测试。', kind = 'user') => stop(new Error(message), kind);
     const output = (stream, chunk) => {
       outputSize += chunk.length;
       if (outputSize > MAX_TEST_OUTPUT) return stop(new Error('测试日志超过 4 MiB，任务已停止。'));
@@ -1462,13 +2325,14 @@ function executePerformanceTest(recipe, launch, req, res) {
     child.stdin.end(launch.input);
     const timeout = setTimeout(() => stop(new Error(`测试超过 ${recipe.timeoutMs / 1000} 秒，已停止。`)), recipe.timeoutMs);
     res.on('close', () => { if (!finished) stop(new Error('浏览器已断开，测试任务已停止。')); });
-    child.on('close', (code, signal) => {
+    child.on('close', async (code, signal) => {
       finished = true;
       clearTimeout(timeout);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (activePerformanceTest?.child === child) activePerformanceTest = null;
+      const cleanup = active.stopPromise ? await active.stopPromise : { confirmed:true };
+      if (terminalError && !cleanup.confirmed) terminalError = new Error(`${terminalError.message}；无法确认测试程序已完全退出：${cleanup.error || '清理失败'}`);
+      if (activePerformanceTest === active) activePerformanceTest = null;
       const durationMs = Date.now() - startedAt;
-      if (terminalError) sendStreamEvent(res, { type: 'error', error: terminalError.message, durationMs });
+      if (terminalError) sendStreamEvent(res, { type:'error', error:terminalError.message, stopped:active.stopKind === 'user', cleanupConfirmed:cleanup.confirmed, durationMs });
       else sendStreamEvent(res, { type: 'result', success: code === 0, code, signal, durationMs });
       if (!res.writableEnded) res.end();
       resolve();
@@ -1550,6 +2414,33 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === 'POST' && url.pathname === '/api/tests/stop') {
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 1_000) return sendJson(res, 413, { error:'请求过大。' });
+    }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJson(res, 400, { error:'请求不是有效的 JSON。' }); }
+    let runId;
+    try { runId = validTestRunId(payload.runId); }
+    catch (error) { return sendJson(res, 400, { error:errorMessage(error) }); }
+    const active = activePerformanceTest;
+    if (!active) return sendJson(res, 200, { stopped:true, confirmed:true, alreadyExited:true });
+    if (active.runId !== runId) return sendJson(res, 409, { error:'运行标识与当前测试不匹配，未执行停止操作。' });
+    try {
+      const result = await active.requestStop('用户请求停止测试。', 'user');
+      sendJson(res, 200, {
+        stopped:true,
+        confirmed:Boolean(result?.confirmed),
+        error:result?.confirmed ? '' : (result?.error || '无法确认测试程序已完全退出。')
+      });
+    } catch (error) {
+      sendJson(res, 500, { stopped:false, confirmed:false, error:errorMessage(error) });
+    }
+    return;
+  }
   if (req.method === 'POST' && url.pathname === '/api/ep/singleep/run') {
     let body = '';
     for await (const chunk of req) {
@@ -1567,7 +2458,7 @@ const server = http.createServer(async (req, res) => {
     let config;
     try {
       config = singleEpRequest(payload);
-      testLaunch(payload.target, 'true\n');
+      normalizeTestTarget(payload.target);
     } catch (error) {
       return sendJson(res, 400, { error: errorMessage(error) });
     }
@@ -1597,8 +2488,9 @@ const server = http.createServer(async (req, res) => {
     let recipe;
     let launch;
     try {
-      recipe = testRecipe(payload);
-      launch = testLaunch(payload.target, recipe.script);
+      const runId = createTestRunId();
+      recipe = testRecipe(payload, runId);
+      launch = testLaunch(payload.target, recipe.script, { runId, execution:recipe.execution });
     } catch (error) {
       return sendJson(res, 400, { error: errorMessage(error) });
     }
@@ -1618,4 +2510,4 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, { 'Content-Type': types[path.extname(fullPath)] || 'application/octet-stream' });
   fs.createReadStream(fullPath).pipe(res);
 });
-server.listen(PORT, HOST, () => console.log(`Machine Topology: http://${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => console.log(`沐曦通信库巡检平台: http://${HOST}:${PORT}`));

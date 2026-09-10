@@ -1,8 +1,8 @@
 {
-  "name": "machine-topology",
+  "name": "metax-communication-inspection-platform",
   "version": "0.1.0",
   "private": true,
-  "description": "Local and SSH machine PCIe topology explorer",
+  "description": "沐曦通信库巡检平台",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"

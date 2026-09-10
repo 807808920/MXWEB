@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>机器拓扑</title>
+  <title>沐曦通信库巡检平台</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark">M</span><span>Metax Communication Group</span></div>
+    <div class="brand"><span class="brand-mark">沐</span><span>沐曦通信库巡检平台</span></div>
     <nav class="page-tabs" role="tablist" aria-label="主功能">
       <button id="tab-single" class="active" type="button" role="tab" aria-selected="true" aria-controls="single-page" data-page="single">单机检查与测试</button>
       <button id="tab-cluster" type="button" role="tab" aria-selected="false" aria-controls="cluster-page" data-page="cluster">小规模集群检查与测试</button>
@@ -31,7 +31,7 @@
         <label>端口<input id="port" type="number" value="22"></label>
         <label>私钥路径<input id="identity-file" placeholder="~/.ssh/id_ed25519"></label>
       </div>
-      <label class="password-field">登录 / sudo 密码<input id="password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，不保存"></label>
+      <label class="password-field">登录 / sudo 密码<input id="password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，当前页面内复用"></label>
       <button id="scan" class="scan-button"><span class="spinner" hidden></span><span class="button-label">采集拓扑</span></button>
       <button id="root-scan" class="scan-button root-scan-button" title="使用 root 或密码框中的 sudo 密码执行只读采集"><span class="spinner" hidden></span><span class="button-label">Root 采集</span></button>
       <p id="scan-note">在本机执行只读硬件查询，不需要 root 权限。</p>
@@ -68,12 +68,12 @@
 
     <section class="test-warning" aria-label="性能影响提示">
       <span aria-hidden="true">!</span>
-      <div><strong>性能测试会占用 GPU、PCIe 和网络带宽</strong><p>请先确认目标机器无业务任务。系统一次只运行一项测试，断开页面或点击停止会终止测试进程。</p></div>
+      <div><strong>性能测试会占用 GPU、PCIe 和网络带宽</strong><p>请先确认目标机器无业务任务；系统一次只运行一项测试。选择镜像时会创建具备主机设备访问权限的 privileged 临时容器，并在测试结束后自动删除。</p></div>
     </section>
 
     <div class="test-workspace">
       <section class="test-catalog">
-        <div class="panel-title"><div><h2>测试项</h2><p>9 项标准配方，点击选择。</p></div><span id="test-complete-count">0 / 9</span></div>
+        <div class="panel-title"><div><h2>测试项</h2><p>5 项标准配方，点击选择。</p></div><span id="test-complete-count">0 / 5</span></div>
         <div id="test-list" class="test-list"><p class="empty">正在加载测试项…</p></div>
       </section>
 
@@ -81,16 +81,60 @@
         <div class="panel-title"><div><h2 id="selected-test-title">测试配置</h2><p id="selected-test-description">选择左侧测试项后配置参数。</p></div><span id="selected-test-status" class="test-status idle">待测试</span></div>
         <div class="test-config-body">
           <div class="test-config-grid">
-            <label id="field-test-gpu" class="test-field"><span>GPU</span><select id="test-gpu"><option value="0">GPU 0</option></select><small>选择运行单 GPU 测试的设备</small></label>
+            <label id="field-test-container" class="test-field container-test-field"><span>运行环境</span><select id="test-container"><option value="">宿主机</option></select><small id="test-container-hint">采集当前目标后，可选择运行中的容器或本地镜像</small></label>
+            <fieldset id="field-test-p2p" class="test-field p2p-pair-field" hidden>
+              <legend>本机 P2P 双端</legend>
+              <div class="p2p-pair-grid">
+                <section class="p2p-endpoint" aria-labelledby="p2p-endpoint-a-title">
+                  <div class="p2p-endpoint-heading"><strong id="p2p-endpoint-a-title">端点 A</strong><span>Server</span></div>
+                  <label><span>GPU</span><select id="test-p2p-gpu-a"><option value="0">GPU 0</option></select></label>
+                  <label><span>RDMA HCA</span><select id="test-p2p-nic-a"><option value="">请先采集 HCA</option></select></label>
+                  <output id="test-p2p-distance-a" class="p2p-distance">距离：待采集拓扑</output>
+                </section>
+                <div class="p2p-localhost-link" aria-label="通过 localhost 建立测试连接"><span>localhost</span><i aria-hidden="true">↔</i></div>
+                <section class="p2p-endpoint" aria-labelledby="p2p-endpoint-b-title">
+                  <div class="p2p-endpoint-heading"><strong id="p2p-endpoint-b-title">端点 B</strong><span>Client</span></div>
+                  <label><span>GPU</span><select id="test-p2p-gpu-b"><option value="1">GPU 1</option></select></label>
+                  <label><span>RDMA HCA</span><select id="test-p2p-nic-b"><option value="">请先采集 HCA</option></select></label>
+                  <output id="test-p2p-distance-b" class="p2p-distance">距离：待采集拓扑</output>
+                </section>
+              </div>
+              <small id="test-p2p-gdr-hint">两端通过 localhost 建立连接；GDR 注册方式将在采集后自动判定。</small>
+            </fieldset>
+            <fieldset id="field-test-gpus" class="test-field gpu-test-field">
+              <legend id="test-gpus-legend">GPU 卡选择</legend>
+              <div class="gpu-selector">
+                <div class="gpu-selector-toolbar"><span id="test-gpu-summary">已选 1 / 1 张</span><div><button id="test-gpu-select-all" type="button">全选</button><button id="test-gpu-clear" type="button">清空</button></div></div>
+                <div id="test-gpu-options" class="gpu-choice-grid"><label class="gpu-choice"><input type="checkbox" value="0" checked><span>GPU 0</span></label></div>
+              </div>
+              <small id="test-gpus-hint">vectorAdd 编译一次后，将依次在每张所选 GPU 上运行并汇总结果</small>
+            </fieldset>
             <label id="field-test-gpu-count" class="test-field"><span>GPU 数量</span><input id="test-gpu-count" type="number" min="2" max="64" value="2"><small>参与 alltoall 或单机通信的 GPU 数</small></label>
             <label id="field-test-hca" class="test-field"><span>RDMA HCA</span><input id="test-hca" list="test-hca-options" maxlength="64" placeholder="mlx5_0"><datalist id="test-hca-options"></datalist><small>可选择采集到的 HCA，也可手动输入</small></label>
+            <fieldset id="field-test-nics" class="test-field nic-test-field">
+              <legend>RDMA HCA 范围</legend>
+              <div class="gpu-selector nic-selector">
+                <div class="gpu-selector-toolbar"><span id="test-nic-summary">已选 0 / 0 个</span><div><button id="test-nic-select-all" type="button">全选</button><button id="test-nic-clear" type="button">清空</button></div></div>
+                <div id="test-nic-options" class="gpu-choice-grid"><p class="selector-empty">采集拓扑后显示 RDMA HCA</p></div>
+              </div>
+              <small>alltoall 将仅使用勾选的 RDMA HCA，并禁用 PCIe/MetaXLink P2P 与 SHM 通路</small>
+            </fieldset>
             <label id="field-test-transport" class="test-field"><span>网络类型</span><select id="test-transport"><option value="RoCE">RoCE</option><option value="IB">InfiniBand</option></select><small>RoCE 会传入 GID Index</small></label>
-            <label id="field-test-peer" class="test-field"><span>对端地址</span><input id="test-peer" maxlength="253" placeholder="192.168.1.21"><small>对端需先启动匹配的 server，多流测试还需免密 SSH</small></label>
             <label id="field-test-gid" class="test-field"><span>GID Index</span><input id="test-gid" type="number" min="0" max="255" value="3"><small>RoCE 默认使用 3，请以 show_gids 为准</small></label>
-            <label id="field-test-password" class="test-field password-test-field"><span>SSH 密码</span><input id="test-password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，提交后清空"><small>仅用于本次远程登录，不会保存</small></label>
+            <label id="field-test-password" class="test-field password-test-field"><span>SSH 密码</span><input id="test-password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，提交后清空"><small>采集时已输入的密码会在当前页面内自动复用</small></label>
           </div>
+          <section id="field-test-topology" class="test-topology-preview" aria-label="所选设备拓扑入口" hidden>
+            <div class="test-topology-heading"><div><strong>所选设备拓扑</strong><small id="test-topology-detail">采集拓扑后显示连接关系</small></div><div class="test-topology-actions"><span id="test-topology-relation">待采集</span><button id="open-test-topology" type="button">查看拓扑</button></div></div>
+          </section>
+          <dialog id="test-topology-dialog" class="test-topology-dialog" aria-labelledby="test-topology-title">
+            <section class="test-topology-modal">
+              <header><div><strong id="test-topology-title">所选设备拓扑</strong><small id="test-topology-dialog-detail">GPU 与 RDMA HCA 的 PCIe 路径</small></div><button id="close-test-topology" type="button" aria-label="关闭拓扑弹框">×</button></header>
+              <div id="test-topology-canvas" class="test-topology-canvas"><svg id="test-topology-graph" role="img" aria-label="所选 GPU 与网卡拓扑关系"></svg><p id="test-topology-empty">采集当前目标后显示所选 GPU 与网卡的 PCIe 路径。</p></div>
+              <footer><span>绿色：GPU</span><span>橙色：RDMA HCA</span><span>紫色：PCIe Switch</span></footer>
+            </section>
+          </dialog>
           <div class="command-preview"><div><span>执行摘要</span><small>服务端只执行白名单配方，不接受自定义 Shell</small></div><code id="test-command-preview">-</code></div>
-          <label class="impact-confirm"><input id="test-confirm" type="checkbox"><span>我已确认目标 GPU 空闲，并了解测试对计算与网络性能的影响。</span></label>
+          <label class="impact-confirm"><input id="test-confirm" type="checkbox"><span>我已确认目标 GPU 空闲，并了解性能影响；选择镜像时同意创建 privileged 临时容器。</span></label>
           <p id="test-form-note" class="test-form-note">运行前请核对执行目标和参数。</p>
           <div class="test-actions"><button id="run-test" class="run-test-button" type="button">开始测试</button><button id="stop-test" class="stop-test-button" type="button" disabled>停止测试</button></div>
         </div>
@@ -135,7 +179,7 @@
           <label class="test-field"><span>Rank 数量</span><input id="ep-ranks" value="1" maxlength="32" inputmode="numeric" spellcheck="false"><small id="ep-rank-hint">可选：1, 2, 4, 8, 16, 32</small></label>
           <label class="test-field"><span>Hidden Size</span><input id="ep-hidden" type="number" min="256" max="65536" step="256" value="7168"><small>默认 7168，必须是 256 的倍数</small></label>
           <label class="test-field"><span>Token 数量</span><input id="ep-tokens" value="1" maxlength="64" inputmode="numeric" spellcheck="false"><small id="ep-token-hint">Low Latency：1, 2, 4, 8, 16, 32, 64</small></label>
-          <label id="field-ep-password" class="test-field ep-password-field"><span>SSH 密码</span><input id="ep-password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，提交后清空"><small>仅用于本次远程登录，不会保存</small></label>
+          <label id="field-ep-password" class="test-field ep-password-field"><span>SSH 密码</span><input id="ep-password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，提交后清空"><small>采集时已输入的密码会在当前页面内自动复用</small></label>
         </div>
         <div class="ep-combinations"><div><strong>组合预览</strong><small id="ep-combination-summary">1 Rank × 1 Token = 1 组</small></div><div id="ep-combination-list" class="ep-combination-list"></div></div>
         <div class="command-preview"><div><span>执行摘要</span><small>固定调用服务端 SingleEP 白名单启动器</small></div><code id="ep-command-preview">bash run.sh 1 -- --num-tokens 1 --hidden 7168 --warmup 20 --tests 30</code></div>
