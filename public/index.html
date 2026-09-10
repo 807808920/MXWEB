@@ -9,9 +9,19 @@
 <body>
   <header class="topbar">
     <div class="brand"><span class="brand-mark">M</span><span>Metax Communication Group</span></div>
+    <nav class="page-tabs" role="tablist" aria-label="主功能">
+      <button id="tab-single" class="active" type="button" role="tab" aria-selected="true" aria-controls="single-page" data-page="single">单机检查与测试</button>
+      <button id="tab-cluster" type="button" role="tab" aria-selected="false" aria-controls="cluster-page" data-page="cluster">小规模集群检查与测试</button>
+    </nav>
     <div id="connection" class="connection"><i></i>等待采集</div>
   </header>
-  <main>
+  <main id="single-page" class="page-panel" role="tabpanel" aria-labelledby="tab-single">
+    <nav class="single-tabs" role="tablist" aria-label="单机功能">
+      <button id="single-tab-info" class="active" type="button" role="tab" aria-selected="true" aria-controls="info-page" data-single-view="info">基本信息</button>
+      <button id="single-tab-tests" type="button" role="tab" aria-selected="false" aria-controls="tests-page" data-single-view="tests">基本功能测试</button>
+      <button id="single-tab-ep" type="button" role="tab" aria-selected="false" aria-controls="ep-page" data-single-view="ep">EP 测试</button>
+    </nav>
+  <section id="info-page" class="single-view" role="tabpanel" aria-labelledby="single-tab-info">
     <section class="scan-bar" aria-label="机器连接">
       <div class="segmented" role="tablist"><button class="active" data-kind="local">本机</button><button data-kind="remote">远程 SSH</button></div>
       <label class="profile-field">运行模式<select id="profile"><option value="auto">自动识别</option><option value="physical">物理机 / Docker</option><option value="virtualized">虚拟化</option></select></label>
@@ -41,6 +51,164 @@
       <aside class="detail-panel"><div class="panel-title"><h2>设备详情</h2></div><div id="detail" class="detail"><p class="empty">在左侧设备列表或图中选择设备。</p></div></aside>
     </section>
     <section class="diagnostics"><div class="panel-title"><div><h2>原始诊断输出</h2><p>用于核对驱动和链路状态。</p></div><div class="tabs"><button class="active" data-output="gpuTopo">mx-smi topo</button><button data-output="ibstat">ibstat</button><button data-output="pcieControls">PCIe 控制</button><button data-output="roce">RoCE</button><button data-output="gids">GID</button><button data-output="dmesg">dmesg</button><button data-output="ofed">ofed_info</button><button data-output="macainfo">macainfo</button></div></div><pre id="terminal">尚无输出</pre></section>
+  </section>
+  <section id="tests-page" class="single-view tests-page" role="tabpanel" aria-labelledby="single-tab-tests" hidden>
+    <section class="test-heading">
+      <div>
+        <p class="eyebrow">受控性能验证</p>
+        <h1>基本功能测试</h1>
+        <p>使用预定义配方验证 GPU、RDMA 网卡及单机通信链路。</p>
+      </div>
+      <div class="test-target-summary">
+        <span class="target-indicator"></span>
+        <div><small>当前执行目标</small><strong id="test-target-name">本机</strong><span id="test-target-detail">建议先在基本信息页采集硬件信息</span></div>
+        <button id="go-info" type="button">修改目标</button>
+      </div>
+    </section>
+
+    <section class="test-warning" aria-label="性能影响提示">
+      <span aria-hidden="true">!</span>
+      <div><strong>性能测试会占用 GPU、PCIe 和网络带宽</strong><p>请先确认目标机器无业务任务。系统一次只运行一项测试，断开页面或点击停止会终止测试进程。</p></div>
+    </section>
+
+    <div class="test-workspace">
+      <section class="test-catalog">
+        <div class="panel-title"><div><h2>测试项</h2><p>9 项标准配方，点击选择。</p></div><span id="test-complete-count">0 / 9</span></div>
+        <div id="test-list" class="test-list"><p class="empty">正在加载测试项…</p></div>
+      </section>
+
+      <section class="test-config">
+        <div class="panel-title"><div><h2 id="selected-test-title">测试配置</h2><p id="selected-test-description">选择左侧测试项后配置参数。</p></div><span id="selected-test-status" class="test-status idle">待测试</span></div>
+        <div class="test-config-body">
+          <div class="test-config-grid">
+            <label id="field-test-gpu" class="test-field"><span>GPU</span><select id="test-gpu"><option value="0">GPU 0</option></select><small>选择运行单 GPU 测试的设备</small></label>
+            <label id="field-test-gpu-count" class="test-field"><span>GPU 数量</span><input id="test-gpu-count" type="number" min="2" max="64" value="2"><small>参与 alltoall 或单机通信的 GPU 数</small></label>
+            <label id="field-test-hca" class="test-field"><span>RDMA HCA</span><input id="test-hca" list="test-hca-options" maxlength="64" placeholder="mlx5_0"><datalist id="test-hca-options"></datalist><small>可选择采集到的 HCA，也可手动输入</small></label>
+            <label id="field-test-transport" class="test-field"><span>网络类型</span><select id="test-transport"><option value="RoCE">RoCE</option><option value="IB">InfiniBand</option></select><small>RoCE 会传入 GID Index</small></label>
+            <label id="field-test-peer" class="test-field"><span>对端地址</span><input id="test-peer" maxlength="253" placeholder="192.168.1.21"><small>对端需先启动匹配的 server，多流测试还需免密 SSH</small></label>
+            <label id="field-test-gid" class="test-field"><span>GID Index</span><input id="test-gid" type="number" min="0" max="255" value="3"><small>RoCE 默认使用 3，请以 show_gids 为准</small></label>
+            <label id="field-test-password" class="test-field password-test-field"><span>SSH 密码</span><input id="test-password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，提交后清空"><small>仅用于本次远程登录，不会保存</small></label>
+          </div>
+          <div class="command-preview"><div><span>执行摘要</span><small>服务端只执行白名单配方，不接受自定义 Shell</small></div><code id="test-command-preview">-</code></div>
+          <label class="impact-confirm"><input id="test-confirm" type="checkbox"><span>我已确认目标 GPU 空闲，并了解测试对计算与网络性能的影响。</span></label>
+          <p id="test-form-note" class="test-form-note">运行前请核对执行目标和参数。</p>
+          <div class="test-actions"><button id="run-test" class="run-test-button" type="button">开始测试</button><button id="stop-test" class="stop-test-button" type="button" disabled>停止测试</button></div>
+        </div>
+      </section>
+    </div>
+
+    <section class="test-log-panel">
+      <div class="panel-title"><div><h2>实时日志</h2><p id="test-log-caption">尚未运行测试。</p></div><button id="clear-test-log" class="clear-log-button" type="button">清空日志</button></div>
+      <pre id="test-terminal" aria-live="polite"><span class="log-muted">$ 选择测试项并确认性能影响后开始</span></pre>
+    </section>
+  </section>
+  <section id="ep-page" class="single-view ep-page" role="tabpanel" aria-labelledby="single-tab-ep" hidden>
+    <section class="test-heading">
+      <div>
+        <p class="eyebrow">Expert Parallel Benchmark</p>
+        <h1>EP 测试</h1>
+        <p>按 Rank 与 Token 参数组合批量运行，并汇总延时和带宽。</p>
+      </div>
+      <div id="ep-target-summary" class="test-target-summary">
+        <span class="target-indicator"></span>
+        <div><small>当前执行目标</small><strong id="ep-target-name">本机</strong><span id="ep-target-detail">建议先在基本信息页采集硬件信息</span></div>
+        <button id="ep-go-info" type="button">修改目标</button>
+      </div>
+    </section>
+
+    <nav class="ep-engine-tabs" role="tablist" aria-label="EP 实现">
+      <button class="active" type="button" role="tab" aria-selected="true" data-ep-engine="singleep"><span>SingleEP</span><small>当前可用</small></button>
+      <button type="button" role="tab" aria-selected="false" aria-disabled="true" disabled data-ep-engine="megakernel"><span>MegaKernel</span><small>入口预留</small></button>
+      <button type="button" role="tab" aria-selected="false" aria-disabled="true" disabled data-ep-engine="deepep"><span>DeepEP</span><small>入口预留</small></button>
+    </nav>
+
+    <section class="test-warning" aria-label="性能影响提示">
+      <span aria-hidden="true">!</span>
+      <div><strong>SingleEP 会独占多张 GPU 并产生高强度通信负载</strong><p>参数组合按顺序逐轮执行。请确认所需 GPU 均空闲；停止或关闭页面会终止当前测试及剩余组合。</p></div>
+    </section>
+
+    <section class="ep-config">
+      <div class="panel-title"><div><h2>SingleEP 参数</h2><p>逗号分隔的 Rank 与 Token 将生成笛卡尔积组合。</p></div><span id="ep-combination-count">1 组</span></div>
+      <div class="ep-config-body">
+        <div class="ep-config-grid">
+          <label class="test-field"><span>测试种类</span><select id="ep-test-type"><option value="low-latency">Low Latency</option><option value="intranode">Intranode</option><option value="internode">Internode</option></select><small id="ep-type-hint">单机 P2P，支持 1/2/4/8/16/32 ranks</small></label>
+          <label class="test-field"><span>Rank 数量</span><input id="ep-ranks" value="1" maxlength="32" inputmode="numeric" spellcheck="false"><small id="ep-rank-hint">可选：1, 2, 4, 8, 16, 32</small></label>
+          <label class="test-field"><span>Hidden Size</span><input id="ep-hidden" type="number" min="256" max="65536" step="256" value="7168"><small>默认 7168，必须是 256 的倍数</small></label>
+          <label class="test-field"><span>Token 数量</span><input id="ep-tokens" value="1" maxlength="64" inputmode="numeric" spellcheck="false"><small id="ep-token-hint">Low Latency：1, 2, 4, 8, 16, 32, 64</small></label>
+          <label id="field-ep-password" class="test-field ep-password-field"><span>SSH 密码</span><input id="ep-password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，提交后清空"><small>仅用于本次远程登录，不会保存</small></label>
+        </div>
+        <div class="ep-combinations"><div><strong>组合预览</strong><small id="ep-combination-summary">1 Rank × 1 Token = 1 组</small></div><div id="ep-combination-list" class="ep-combination-list"></div></div>
+        <div class="command-preview"><div><span>执行摘要</span><small>固定调用服务端 SingleEP 白名单启动器</small></div><code id="ep-command-preview">bash run.sh 1 -- --num-tokens 1 --hidden 7168 --warmup 20 --tests 30</code></div>
+        <label class="impact-confirm"><input id="ep-confirm" type="checkbox"><span>我已确认目标 GPU 空闲，并了解批量 EP 测试的性能影响。</span></label>
+        <p id="ep-form-note" class="test-form-note">参数会在服务端再次校验；每轮最长 300 秒。</p>
+        <div class="ep-actions"><button id="run-ep" class="run-test-button" type="button">开始批量测试</button><button id="stop-ep" class="stop-test-button" type="button" disabled>停止测试</button><div id="ep-progress" class="ep-progress" role="progressbar" aria-label="EP 测试进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-track"><i></i></div><span id="ep-progress-label">等待开始</span></div></div>
+      </div>
+    </section>
+
+    <section class="ep-results-panel">
+      <div class="panel-title"><div><h2>测试结果</h2><p id="ep-results-caption">尚无结果。Low Latency 使用跨 Rank 平均延时；Normal 测试使用最慢 Rank 延时。</p></div><button id="export-ep-csv" class="clear-log-button" type="button" disabled>导出 CSV</button></div>
+      <div class="ep-summary-strip"><div><strong id="ep-result-total">0</strong><span>已完成</span></div><div><strong id="ep-result-passed">0</strong><span>通过</span></div><div><strong id="ep-result-failed">0</strong><span>失败</span></div><div><strong id="ep-result-avg">-</strong><span>平均延时 µs</span></div></div>
+      <div class="ep-table-wrap">
+        <table class="ep-results-table">
+          <thead><tr><th>轮次</th><th>测试种类</th><th>Rank</th><th>Token</th><th>Hidden</th><th>平均/总延时 µs</th><th>带宽 GB/s</th><th>Dispatch µs</th><th>Combine µs</th><th>统计口径</th><th>状态</th><th>耗时</th></tr></thead>
+          <tbody id="ep-results-body"><tr><td colspan="12" class="ep-empty-row">运行后在此汇总每组参数。</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="test-log-panel ep-log-panel">
+      <div class="panel-title"><div><h2>实时日志</h2><p id="ep-log-caption">尚未运行测试。</p></div><button id="clear-ep-log" class="clear-log-button" type="button">清空日志</button></div>
+      <pre id="ep-terminal" aria-live="polite"><span class="log-muted">$ 配置参数并确认性能影响后开始</span></pre>
+    </section>
+  </section>
+  </main>
+  <main id="cluster-page" class="page-panel cluster-page" role="tabpanel" aria-labelledby="tab-cluster" hidden>
+    <section class="cluster-heading">
+      <div><p class="eyebrow">并行硬件一致性巡检</p><h1>小规模集群检查与测试</h1><p>一次采集 2、4 或 8 台机器，比对机器配置、NIC、GPU 与 PCIe 拓扑。</p></div>
+      <div id="cluster-summary" class="cluster-summary"><strong>尚未采集</strong><span>选择规模并填写机器 IP</span></div>
+    </section>
+
+    <section class="cluster-setup">
+      <div class="panel-title"><div><h2>集群连接</h2><p>所有机器共用 SSH 用户、密码、端口和私钥，IP 用逗号、中文逗号或换行分隔。</p></div><span id="cluster-host-count">0 / 2</span></div>
+      <div class="cluster-config-body">
+        <div id="cluster-size" class="cluster-size-selector" role="group" aria-label="集群规模">
+          <span>集群规模</span>
+          <button class="active" type="button" data-cluster-size="2">2 台</button>
+          <button type="button" data-cluster-size="4">4 台</button>
+          <button type="button" data-cluster-size="8">8 台</button>
+        </div>
+        <label class="cluster-host-field"><span>机器 IP / 主机名</span><textarea id="cluster-hosts" rows="3" spellcheck="false" placeholder="192.168.1.21, 192.168.1.22"></textarea><small id="cluster-host-hint">请输入 2 个不重复的地址。</small></label>
+        <div class="cluster-auth-grid">
+          <label class="cluster-field"><span>SSH 用户</span><input id="cluster-user" maxlength="64" placeholder="root"></label>
+          <label class="cluster-field"><span>登录 / sudo 密码</span><input id="cluster-password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，提交后清空"></label>
+          <label class="cluster-field cluster-port-field"><span>SSH 端口</span><input id="cluster-port" type="number" min="1" max="65535" value="22"></label>
+          <label class="cluster-field"><span>私钥路径</span><input id="cluster-identity-file" maxlength="1024" placeholder="~/.ssh/id_ed25519"></label>
+          <label class="cluster-field"><span>运行模式</span><select id="cluster-profile"><option value="auto">自动识别</option><option value="physical">物理机 / Docker</option><option value="virtualized">虚拟化</option></select></label>
+        </div>
+        <div class="cluster-actions">
+          <label class="cluster-root-option"><input id="cluster-root" type="checkbox"><span>使用 root 权限采集（非 root 账户使用上方密码 sudo）</span></label>
+          <button id="cluster-scan" class="scan-button cluster-scan-button" type="button"><span class="spinner" hidden></span><span class="button-label">开始集群采集</span></button>
+          <div id="cluster-progress" class="cluster-progress" role="progressbar" aria-label="集群采集进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div class="progress-track"><i></i></div><span id="cluster-progress-label">准备采集</span></div>
+        </div>
+        <p id="cluster-note" class="cluster-note">仅执行只读采集；各机器并行连接，单台失败不会中断其他机器。</p>
+      </div>
+    </section>
+
+    <section class="cluster-check-section">
+      <div class="panel-title"><div><h2>集群一致性检查</h2><p>结果为所有成功采集机器间的横向比对。</p></div><span id="cluster-check-summary">0 / 6</span></div>
+      <div id="cluster-checks" class="cluster-checks"></div>
+    </section>
+
+    <section class="cluster-results">
+      <aside class="cluster-machine-panel">
+        <div class="panel-title"><div><h2>机器列表</h2><p>点击查看独立检查结果。</p></div><span id="cluster-machine-total">0</span></div>
+        <div id="cluster-machines" class="cluster-machines"><p class="empty">尚无集群采集结果</p></div>
+      </aside>
+      <section class="cluster-detail-panel">
+        <div class="panel-title"><div><h2 id="cluster-detail-title">单机检查结果</h2><p id="cluster-detail-caption">从左侧选择机器。</p></div><button id="cluster-open-single" class="open-single-button" type="button" hidden>在单机页查看完整拓扑</button></div>
+        <div id="cluster-detail" class="cluster-detail"><p class="empty">采集后可查看每台机器的配置、比对值和基础巡检结果。</p></div>
+      </section>
+    </section>
   </main>
   <script src="/app.js"></script>
 </body>

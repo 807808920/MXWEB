@@ -56,4 +56,31 @@
             - 网卡多流测试 (alltoall)
         - 单机通信测试
             - IBRC测试
-            - IBGDA测试        
+            - IBGDA测试
+
+
+补充需求6：
+- 将目前的基本信息和基本功能测试tab页合并为单机检查与测试tab页
+- 增加小规模集群检查与测试tab页（2/4/8机器）
+- 点击后输入2,4,8机器登录信息。（用户名密码可复用，IP地址输入框，支持输入多个IP，用逗号分隔）
+- 检查项包括：
+    - 机器配置一致性检查
+    - 网卡固件一致性检查
+    - 网卡速率一致性检查
+    - GPU固件一致性检查
+    - GPU型号一致性检查
+    - 拓扑一致性检查
+- 可单独查看每台机器的检查结果
+
+
+补充需求7:
+- 单机检查与测试中增加EP测试
+    - EP测试中分为singleep测试，megakernel测试(先不做，先预留入口)，deepep测试(先不做，先预留入口)
+    - 先实现singlep测试，测试参考/home/lchen1/data/projs/llopt/codex/singleep/test/README.md
+    - singleep支持 多轮测试，将测试结果汇总成表格，并支持导出csv
+    - 测试参数包括：
+    - 测试种类3选1， low lantency测试， internode测试， intranode测试
+    - rank数量 [1,2,4,8,16,32] 可以支持逗号进行多轮测试
+    - hiddensize 默认 7168，可支持配置
+    - token数量 [1,2,4,8,16,32,64] for low latency, [128,256,512,1024,2048,4096,8192] for internode/intranode, 可以支持逗号进行多轮测试
+    - 测试结果主要关心 平均延时（带宽）
