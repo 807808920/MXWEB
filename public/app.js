@@ -1,5 +1,5 @@
 const state = {
-  kind: 'local', data: null, selected: null, output: 'gpuTopo', positions: null,
+  kind: 'remote', data: null, selected: null, output: 'gpuTopo', positions: null,
   collapsed: new Set(), graphWidth: 1320, graphHeight: 600,
   view: { x: 0, y: 0, zoom: 1 }, gesture: null, progressHideTimer: null,
   page: 'home', singleView: 'info', scanLoading: false,
@@ -454,6 +454,11 @@ async function readScanResponse(response) {
   return result;
 }
 async function scan(useRoot = false) {
+  if (state.kind === 'remote' && !$('#host').value.trim()) {
+    setTopConnection('error', '缺少远程地址');
+    $('#scan-note').textContent = '请先填写远程地址，再执行采集。';
+    return;
+  }
   setLoading(true, useRoot);
   const passwordInput = $('#password'); const enteredPassword = passwordInput.value;
   const body = { kind: state.kind, profile: $('#profile').value, useRoot };
@@ -867,8 +872,6 @@ function openClusterNodeInSinglePage() {
   $('#port').value = $('#cluster-port').value || '22';
   $('#identity-file').value = $('#cluster-identity-file').value.trim();
   $('#profile').value = $('#cluster-profile').value;
-  $('#remote-fields').hidden = false;
-  document.querySelectorAll('.segmented button').forEach((button) => button.classList.toggle('active', button.dataset.kind === 'remote'));
   switchPage('single'); switchSingleView('info'); renderAll(); renderTests(true); renderEp();
 }
 
@@ -2399,13 +2402,6 @@ document.querySelectorAll('#cluster-size button').forEach((button) => button.add
 $('#cluster-hosts').addEventListener('input', () => { updateClusterHostCount(); if (!state.cluster.data) renderClusterMachines(); });
 $('#cluster-scan').addEventListener('click', runClusterScan);
 $('#cluster-open-single').addEventListener('click', openClusterNodeInSinglePage);
-document.querySelectorAll('.segmented button').forEach((button) => button.addEventListener('click', () => {
-  state.kind = button.dataset.kind;
-  document.querySelectorAll('.segmented button').forEach((item) => item.classList.toggle('active', item === button));
-  $('#remote-fields').hidden = state.kind !== 'remote';
-  $('#scan-note').textContent = state.kind === 'remote' ? '支持 SSH agent、私钥或密码；连接成功后密码仅在当前页面内复用。' : '本机普通采集无需密码；Root 采集可输入 sudo 密码。';
-  populateTestDeviceOptions(true); renderTestTarget(); renderTestSelection(); renderEpTarget(); renderEpConfiguration();
-}));
 ['host','user','port','identity-file'].forEach((id) => $(`#${id}`).addEventListener('input', () => { populateTestDeviceOptions(true); renderTestTarget(); renderTestSelection(); renderEpTarget(); }));
 $('#test-list').addEventListener('click', (event) => {
   const card = event.target.closest('[data-test-id]');

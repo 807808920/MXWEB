@@ -43,9 +43,9 @@
       <div><p class="eyebrow">第一步 · 连接目标</p><h1>连接目标机器</h1><p>选择本机或远程 SSH 并填写连接信息，点击“连接并采集”；采集成功后进入单机检查与测试。</p></div>
     </section>
     <section class="scan-bar" aria-label="机器连接">
-      <div class="segmented" role="tablist"><button class="active" data-kind="local">本机</button><button data-kind="remote">远程 SSH</button></div>
+      <span class="scan-kind">远程 SSH</span>
       <label class="profile-field">运行模式<select id="profile"><option value="auto">自动识别</option><option value="physical">物理机 / Docker</option><option value="virtualized">虚拟化</option></select></label>
-      <div id="remote-fields" class="remote-fields" hidden>
+      <div id="remote-fields" class="remote-fields">
         <label>地址<input id="host" placeholder="192.168.1.20"></label>
         <label>用户<input id="user" placeholder="root"></label>
         <label>端口<input id="port" type="number" value="22"></label>
@@ -54,7 +54,7 @@
       <label class="password-field">登录 / sudo 密码<input id="password" type="password" maxlength="512" autocomplete="current-password" placeholder="可选，当前页面内复用"></label>
       <button id="scan" class="scan-button"><span class="spinner" hidden></span><span class="button-label">采集拓扑</span></button>
       <button id="root-scan" class="scan-button root-scan-button" title="使用 root 或密码框中的 sudo 密码执行只读采集"><span class="spinner" hidden></span><span class="button-label">Root 采集</span></button>
-      <p id="scan-note">在本机执行只读硬件查询，不需要 root 权限。</p>
+      <p id="scan-note">通过 SSH 连接远程机器；支持 agent、私钥或密码，连接成功后密码仅在当前页面内复用。</p>
       <div id="scan-progress" class="scan-progress" role="progressbar" aria-label="采集进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div class="progress-track"><i></i></div><span id="progress-label">准备采集</span></div>
     </section>
     <nav class="single-tabs" role="tablist" aria-label="单机功能">
