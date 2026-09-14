@@ -10,18 +10,38 @@
   <header class="topbar">
     <div class="brand"><span class="brand-mark">沐</span><span>沐曦通信库巡检平台</span></div>
     <nav class="page-tabs" role="tablist" aria-label="主功能">
-      <button id="tab-single" class="active" type="button" role="tab" aria-selected="true" aria-controls="single-page" data-page="single">单机检查与测试</button>
+      <button id="tab-home" class="active" type="button" role="tab" aria-selected="true" aria-controls="home-page" data-page="home">首页</button>
+      <button id="tab-single" type="button" role="tab" aria-selected="false" aria-controls="single-page" data-page="single">单机检查与测试</button>
       <button id="tab-cluster" type="button" role="tab" aria-selected="false" aria-controls="cluster-page" data-page="cluster">小规模集群检查与测试</button>
     </nav>
-    <div id="connection" class="connection"><i></i>等待采集</div>
+    <div id="connection" class="connection"><i></i>选择巡检模式</div>
   </header>
-  <main id="single-page" class="page-panel" role="tabpanel" aria-labelledby="tab-single">
-    <nav class="single-tabs" role="tablist" aria-label="单机功能">
-      <button id="single-tab-info" class="active" type="button" role="tab" aria-selected="true" aria-controls="info-page" data-single-view="info">基本信息</button>
-      <button id="single-tab-tests" type="button" role="tab" aria-selected="false" aria-controls="tests-page" data-single-view="tests">基本功能测试</button>
-      <button id="single-tab-ep" type="button" role="tab" aria-selected="false" aria-controls="ep-page" data-single-view="ep">EP 测试</button>
-    </nav>
-  <section id="info-page" class="single-view" role="tabpanel" aria-labelledby="single-tab-info">
+  <main id="home-page" class="page-panel home-page" role="tabpanel" aria-labelledby="tab-home">
+    <section class="home-hero">
+      <p class="eyebrow">沐曦通信库巡检平台</p>
+      <h1>选择巡检模式</h1>
+      <p>先选择巡检范围，再填写连接信息；采集成功后进入对应的检查与测试页面。</p>
+      <p class="home-version">当前版本 <strong id="app-version">__APP_VERSION__</strong></p>
+    </section>
+    <div class="home-choices">
+      <button id="home-single" class="home-choice" type="button">
+        <span class="home-choice-badge">单机</span>
+        <strong>单机巡检测试</strong>
+        <span class="home-choice-copy">连接本机或一台远程机器（SSH），查看 CPU / GPU / NIC / PCIe Switch 拓扑与合规检查，并运行基本功能测试和 EP 测试。</span>
+        <span class="home-choice-action">填写连接信息 →</span>
+      </button>
+      <button id="home-cluster" class="home-choice" type="button">
+        <span class="home-choice-badge">集群</span>
+        <strong>集群巡检测试</strong>
+        <span class="home-choice-copy">并行采集 2、4 或 8 台机器（SSH），比对机器配置、网卡/GPU 固件、网卡速率与拓扑一致性。</span>
+        <span class="home-choice-action">填写连接信息 →</span>
+      </button>
+    </div>
+  </main>
+  <main id="single-page" class="page-panel" role="tabpanel" aria-labelledby="tab-single" hidden>
+    <section id="single-connect-heading" class="connect-heading">
+      <div><p class="eyebrow">第一步 · 连接目标</p><h1>连接目标机器</h1><p>选择本机或远程 SSH 并填写连接信息，点击“连接并采集”；采集成功后进入单机检查与测试。</p></div>
+    </section>
     <section class="scan-bar" aria-label="机器连接">
       <div class="segmented" role="tablist"><button class="active" data-kind="local">本机</button><button data-kind="remote">远程 SSH</button></div>
       <label class="profile-field">运行模式<select id="profile"><option value="auto">自动识别</option><option value="physical">物理机 / Docker</option><option value="virtualized">虚拟化</option></select></label>
@@ -37,9 +57,19 @@
       <p id="scan-note">在本机执行只读硬件查询，不需要 root 权限。</p>
       <div id="scan-progress" class="scan-progress" role="progressbar" aria-label="采集进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><div class="progress-track"><i></i></div><span id="progress-label">准备采集</span></div>
     </section>
+    <nav class="single-tabs" role="tablist" aria-label="单机功能">
+      <button id="single-tab-info" class="active" type="button" role="tab" aria-selected="true" aria-controls="info-page" data-single-view="info">基本信息</button>
+      <button id="single-tab-tests" type="button" role="tab" aria-selected="false" aria-controls="tests-page" data-single-view="tests">基本功能测试</button>
+      <button id="single-tab-ep" type="button" role="tab" aria-selected="false" aria-controls="ep-page" data-single-view="ep">EP 测试</button>
+    </nav>
+  <section id="info-page" class="single-view" role="tabpanel" aria-labelledby="single-tab-info">
     <section class="machine-heading">
       <div><p class="eyebrow">硬件互连视图</p><h1 id="hostname">未选择机器</h1><p id="collected-at">采集后将展示 CPU、GPU、NIC 与 PCIe Switch 的关系。</p><p id="compliance-summary" class="compliance-summary">尚未执行合规检查</p></div>
       <div class="counts"><div><strong id="count-cpu">-</strong><span>NUMA / CPU</span></div><div><strong id="count-gpu">-</strong><span>GPU</span></div><div><strong id="count-nic">-</strong><span>NIC</span></div><div><strong id="count-switch">-</strong><span>PCIe Switch</span></div></div>
+    </section>
+    <section class="machine-facts" aria-label="机器配置">
+      <div class="panel-title"><div><h2>机器配置</h2><p>整机型号、CPU、内存、系统与固件版本。</p></div><span id="machine-facts-host">-</span></div>
+      <dl id="machine-facts" class="machine-facts-list"><div class="empty">采集后显示机器配置。</div></dl>
     </section>
     <section class="inspection" aria-label="基础巡检">
       <div class="panel-title"><div><h2>基础巡检</h2><p>只读采集。黄色为需要结合集群 profile 或权限进一步核验的项目。</p></div><span id="inspection-total">-</span></div>
@@ -57,7 +87,7 @@
       <div>
         <p class="eyebrow">受控性能验证</p>
         <h1>基本功能测试</h1>
-        <p>使用预定义配方验证 GPU、RDMA 网卡及单机通信链路。</p>
+        <p>使用预定义配方验证 GPU、RDMA 网卡及 PCIe/MetaXLink 链路。</p>
       </div>
       <div class="test-target-summary">
         <span class="target-indicator"></span>
@@ -82,6 +112,7 @@
         <div class="test-config-body">
           <div class="test-config-grid">
             <label id="field-test-container" class="test-field container-test-field"><span>运行环境</span><select id="test-container"><option value="">宿主机</option></select><small id="test-container-hint">采集当前目标后，可选择运行中的容器或本地镜像</small></label>
+            <label id="field-test-maca" class="test-field"><span>MACA 版本</span><select id="test-maca"><option value="/opt/maca">默认 /opt/maca</option></select><small id="test-maca-hint">选择 /opt 下检测到的 MACA，测试将使用该路径下的工具与库</small></label>
             <fieldset id="field-test-p2p" class="test-field p2p-pair-field" hidden>
               <legend>本机 P2P 双端</legend>
               <div class="p2p-pair-grid">
@@ -101,15 +132,31 @@
               </div>
               <small id="test-p2p-gdr-hint">两端通过 localhost 建立连接；GDR 注册方式将在采集后自动判定。</small>
             </fieldset>
+            <fieldset id="field-test-pcie-p2p" class="test-field p2p-pair-field" hidden>
+              <legend>GPU 间 P2P</legend>
+              <div class="p2p-pair-grid">
+                <section class="p2p-endpoint" aria-labelledby="pcie-endpoint-a-title">
+                  <div class="p2p-endpoint-heading"><strong id="pcie-endpoint-a-title">GPU A</strong><span>TransferBench</span></div>
+                  <label><span>GPU</span><select id="test-pcie-gpu-a"><option value="0">GPU 0</option></select></label>
+                </section>
+                <div class="p2p-localhost-link" aria-label="GPU 间 PCIe/MetaXLink 连接"><span>PCIe / MetaXLink</span><i aria-hidden="true">↔</i></div>
+                <section class="p2p-endpoint" aria-labelledby="pcie-endpoint-b-title">
+                  <div class="p2p-endpoint-heading"><strong id="pcie-endpoint-b-title">GPU B</strong><span>TransferBench</span></div>
+                  <label><span>GPU</span><select id="test-pcie-gpu-b"><option value="1">GPU 1</option></select></label>
+                </section>
+              </div>
+              <output id="test-pcie-distance" class="p2p-distance">链路：待采集拓扑</output>
+              <label class="test-field pcie-path-field"><span>传输链路</span><select id="test-pcie-path"><option value="auto">自动（优先 MetaXLink）</option><option value="pcie">优先 PCIe</option><option value="metaxlink">优先 MetaXLink</option></select><small>仅在所选两张 GPU 存在 MetaXLink 时可选“优先 MetaXLink”；通过 TransferBench USE_PCIE_FIRST 控制</small></label>
+              <small>使用 /opt/maca/samples/mccl_tests/benchmark/TransferBenchMaca 测试所选两张 GPU 之间的 PCIe/MetaXLink 带宽。</small>
+            </fieldset>
             <fieldset id="field-test-gpus" class="test-field gpu-test-field">
               <legend id="test-gpus-legend">GPU 卡选择</legend>
               <div class="gpu-selector">
                 <div class="gpu-selector-toolbar"><span id="test-gpu-summary">已选 1 / 1 张</span><div><button id="test-gpu-select-all" type="button">全选</button><button id="test-gpu-clear" type="button">清空</button></div></div>
                 <div id="test-gpu-options" class="gpu-choice-grid"><label class="gpu-choice"><input type="checkbox" value="0" checked><span>GPU 0</span></label></div>
               </div>
-              <small id="test-gpus-hint">vectorAdd 编译一次后，将依次在每张所选 GPU 上运行并汇总结果</small>
+              <small id="test-gpus-hint">vectorAdd 编译一次后，将在每张所选 GPU 上并行运行并汇总结果</small>
             </fieldset>
-            <label id="field-test-gpu-count" class="test-field"><span>GPU 数量</span><input id="test-gpu-count" type="number" min="2" max="64" value="2"><small>参与 alltoall 或单机通信的 GPU 数</small></label>
             <label id="field-test-hca" class="test-field"><span>RDMA HCA</span><input id="test-hca" list="test-hca-options" maxlength="64" placeholder="mlx5_0"><datalist id="test-hca-options"></datalist><small>可选择采集到的 HCA，也可手动输入</small></label>
             <fieldset id="field-test-nics" class="test-field nic-test-field">
               <legend>RDMA HCA 范围</legend>
@@ -130,7 +177,7 @@
             <section class="test-topology-modal">
               <header><div><strong id="test-topology-title">所选设备拓扑</strong><small id="test-topology-dialog-detail">GPU 与 RDMA HCA 的 PCIe 路径</small></div><button id="close-test-topology" type="button" aria-label="关闭拓扑弹框">×</button></header>
               <div id="test-topology-canvas" class="test-topology-canvas"><svg id="test-topology-graph" role="img" aria-label="所选 GPU 与网卡拓扑关系"></svg><p id="test-topology-empty">采集当前目标后显示所选 GPU 与网卡的 PCIe 路径。</p></div>
-              <footer><span>绿色：GPU</span><span>橙色：RDMA HCA</span><span>紫色：PCIe Switch</span></footer>
+              <footer><span>绿色：GPU</span><span id="test-topology-legend-nic">橙色：RDMA HCA</span><span>紫色：PCIe Switch</span></footer>
             </section>
           </dialog>
           <div class="command-preview"><div><span>执行摘要</span><small>服务端只执行白名单配方，不接受自定义 Shell</small></div><code id="test-command-preview">-</code></div>
@@ -207,6 +254,9 @@
   </section>
   </main>
   <main id="cluster-page" class="page-panel cluster-page" role="tabpanel" aria-labelledby="tab-cluster" hidden>
+    <section id="cluster-connect-heading" class="connect-heading">
+      <div><p class="eyebrow">第一步 · 连接集群</p><h1>连接集群机器</h1><p>选择集群规模并填写全部机器的 SSH 信息，点击“开始集群采集”；采集成功后进入一致性检查。</p></div>
+    </section>
     <section class="cluster-heading">
       <div><p class="eyebrow">并行硬件一致性巡检</p><h1>小规模集群检查与测试</h1><p>一次采集 2、4 或 8 台机器，比对机器配置、NIC、GPU 与 PCIe 拓扑。</p></div>
       <div id="cluster-summary" class="cluster-summary"><strong>尚未采集</strong><span>选择规模并填写机器 IP</span></div>

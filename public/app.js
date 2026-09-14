@@ -2,26 +2,37 @@ const state = {
   kind: 'local', data: null, selected: null, output: 'gpuTopo', positions: null,
   collapsed: new Set(), graphWidth: 1320, graphHeight: 600,
   view: { x: 0, y: 0, zoom: 1 }, gesture: null, progressHideTimer: null,
-  page: 'single', singleView: 'info',
+  page: 'home', singleView: 'info', scanLoading: false,
+  northbound: { running: false, status: 'idle', output: '' },
+  maca: { probes: new Map(), loadingKey: '', loadingPromise: null },
   tests: { selected: 'gpu-vector-add', results: new Map(), controller: null, running: null, runId: null, stopRequested: false, stopConfirmed: false, stopError: '' },
   ep: { results: [], controller: null, running: false, runId: null, stopRequested: false, stopConfirmed: false, stopError: '', total: 0, completed: 0, current: null, status: 'idle' },
   cluster: { size: 2, data: null, selected: null, running: false, progress: new Map(), error: '' },
-  auth: { remotePasswords: new Map() }
+  auth: { remotePasswords: new Map(), localSudoPassword: '' }
 };
 const $ = (selector) => document.querySelector(selector);
 const svgEl = (name, attrs = {}) => { const el = document.createElementNS('http://www.w3.org/2000/svg', name); Object.entries(attrs).forEach(([key, value]) => el.setAttribute(key, value)); return el; };
-const INVENTORY_TASK_COUNT = 19;
+const INVENTORY_TASK_COUNT = 20;
+const DEFAULT_MACA_PATH = '/opt/maca';
 const IB_WRITE_BW_PATH = '/opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw';
-const MACA_MPIRUN_PATH = '/opt/maca/ompi/bin/mpirun';
-const MCCL_ALLTOALL_PATH = '/opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf';
 const MACA_LIBRARY_PATH_PREVIEW = 'export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH';
+function macaPaths(macaPath = DEFAULT_MACA_PATH) {
+  const base = macaPath || DEFAULT_MACA_PATH;
+  return {
+    base,
+    ibWrite: `${base}/tools/communication/rdma/perftest/tests/ib_write_bw`,
+    bench: `${base}/samples/mccl_tests/benchmark/TransferBenchMaca`,
+    mpirun: `${base}/ompi/bin/mpirun`,
+    alltoall: `${base}/samples/mccl_tests/perf/mccl_perf/alltoall_perf`
+  };
+}
 
 const TEST_DEFINITIONS = [
-  { id:'gpu-vector-add', group:'GPU 单项', kind:'gpu', symbol:'VEC', title:'GPU vectorAdd', summary:'多卡基础计算正确性', description:'编译一次 MACA vectorAdd 示例，并依次验证每张所选 GPU 的基础计算和内存访问。', fields:['gpus'] },
-  { id:'nic-p2p', group:'网卡测试', kind:'nic', symbol:'P2P', title:'P2P', summary:'双 GPU 本机互测', description:'在当前目标内选择两张 GPU，并分别绑定 RDMA HCA（可使用同一个 HCA）；服务端和客户端通过 localhost 自动完成 ib_write_bw 测试。', fields:['p2p','transport','gid','topology'] },
-  { id:'nic-alltoall', group:'网卡测试', kind:'nic', symbol:'A2A', title:'alltoall', summary:'多 GPU / 多 HCA 并发', description:'使用 MCCL alltoall_perf 验证所选 GPU 与 RDMA HCA 范围的并发 IB RC 通路。', fields:['gpus','nics','transport','gid','topology'] },
-  { id:'host-ibrc', group:'单机通信', kind:'host', symbol:'RC', title:'IBRC', summary:'MCCL IB RC alltoall', description:'使用 MCCL alltoall_perf 验证单机多 GPU 经 IB RC 通路的通信能力。', fields:['gpuCount','hca'] },
-  { id:'host-ibgda', group:'单机通信', kind:'host', symbol:'GDA', title:'IBGDA', summary:'mxdeepep internode', description:'使用 mxdeepep test_internode 验证单机多 GPU 的 IBGDA 通信通路。', fields:['gpuCount','hca'] }
+  { id:'gpu-vector-add', group:'GPU 单项', kind:'gpu', symbol:'VEC', title:'GPU vectorAdd', summary:'多卡基础计算正确性', description:'编译一次 MACA vectorAdd 示例，并在每张所选 GPU 上并行验证基础计算和内存访问。', fields:['gpus','maca'] },
+  { id:'nic-p2p', group:'网卡测试', kind:'nic', symbol:'P2P', title:'P2P', summary:'双 GPU 本机互测', description:'在当前目标内选择两张 GPU，并分别绑定 RDMA HCA（可使用同一个 HCA）；服务端和客户端通过 localhost 自动完成 ib_write_bw 测试。', fields:['p2p','transport','gid','maca','topology'] },
+  { id:'nic-alltoall', group:'网卡测试', kind:'nic', symbol:'A2A', title:'alltoall', summary:'多 GPU / 多 HCA 并发', description:'使用 MCCL alltoall_perf 验证所选 GPU 与 RDMA HCA 范围的并发 IB RC 通路。', fields:['gpus','nics','transport','gid','maca','topology'] },
+  { id:'pcie-p2p', group:'Pcie/Metax', kind:'host', symbol:'P2P', title:'P2P', summary:'GPU 间 PCIe/MetaXLink 带宽', description:'选择两张 GPU，使用 TransferBench（参考 benchmark/p2p.sh）测试二者之间的 PCIe/MetaXLink 传输带宽。', fields:['pcie-p2p','maca','topology'] },
+  { id:'pcie-alltoall', group:'Pcie/Metax', kind:'host', symbol:'A2A', title:'alltoall', summary:'GPU 间 PCIe/MetaXLink 并发', description:'使用 MCCL alltoall_perf 并禁用 RDMA 网络与 SHM，验证所选 GPU 之间的 PCIe/MetaXLink P2P 并发通信。', fields:['gpus','maca','topology'] }
 ];
 
 const CLUSTER_CHECK_DEFINITIONS = [
@@ -85,10 +96,18 @@ function updateProgress({ completed = 0, total = INVENTORY_TASK_COUNT, label = '
   $('.progress-track i').style.width = `${percent}%`;
   $('#progress-label').textContent = error ? '采集失败' : done ? '采集完成 · 100%' : `已完成 ${completed}/${total} · ${label}`;
 }
+function scanButtonLabels() {
+  const connected = Boolean(state.data);
+  return {
+    scan: connected ? '重新采集' : '连接并采集',
+    'root-scan': connected ? 'Root 重新采集' : 'Root 连接并采集'
+  };
+}
 function setLoading(value, useRoot = false) {
   if (state.progressHideTimer) { clearTimeout(state.progressHideTimer); state.progressHideTimer = null; }
+  state.scanLoading = value;
   const activeId = useRoot ? 'root-scan' : 'scan';
-  const labels = { scan: '采集拓扑', 'root-scan': 'Root 采集' };
+  const labels = scanButtonLabels();
   ['scan', 'root-scan'].forEach((id) => {
     const button = $(`#${id}`);
     button.disabled = value;
@@ -125,8 +144,22 @@ function renderHeader() {
 function repairFor(title) {
   const fixes = { 'CPU 非 performance 模式':'echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor', 'PCIe ACS 已开启':'物理机/Docker：关闭 BIOS ACS，并按指南关闭 IOMMU 后重启；虚拟机请确认运行模式。', 'IOMMU 未关闭':'物理机/Docker：检查 /proc/cmdline 与 /sys/class/iommu；按指南关闭后重启。', 'DMA-BUF / PEERMEM 均不可用':'优先按指南 8.5.7 升级到支持 DMA-BUF 的内核、RDMA 驱动和 MACA SDK；也可按 9.3.2.1 修复 PEERMEM 注册。', 'OFED 版本不在已验证范围':'安装项目确认过的 MLNX/DOCA OFED 版本（指南 8.6.1）。', '未检测到 OFED':'安装 OFED 后重新执行 ofed_info -s。', '当前用户不在 video 组':'sudo usermod -aG video <用户名>，重新登录。', '文件描述符上限偏低':'提高 /etc/security/limits.conf 的 nofile，并重新登录。', '同型号网卡固件不一致':'使用供应商或 NVIDIA 固件包，将同 CA type 网卡统一到同一版本。', '计算网卡链路非 Active':'检查网线、交换机端口和 IB/RoCE 模式。', 'NIC MRRS 大于 256':'按指南将计算网卡 MaxReadReq 配置为 256 bytes，并在变更前确认设备 BDF。', 'PCIe 链路降速':'检查上游 PCIe Switch、插槽和链路训练状态。' }; return fixes[title] || '请结合部署指南对应章节和集群配置进行处理。'; }
 function renderInspection() {
-  const container = $('#inspection-checks'); container.replaceChildren(); const checks = state.data?.compliance?.checks || []; if (!checks.length) return container.append(Object.assign(document.createElement('p'), { className:'empty', textContent:'采集后显示基础环境检查。' }));
-  const counts = { fail:0, warn:0, pass:0, unknown:0 }; checks.forEach((check) => { counts[check.status] = (counts[check.status] || 0) + 1; const item = document.createElement('button'); item.className = `check-item ${check.status}`; item.title = `${check.name}: ${check.value}${check.detail ? `\n${check.detail}` : ''}`; const dot = document.createElement('i'); const name = document.createElement('strong'); name.textContent = check.name; const value = document.createElement('span'); value.textContent = check.value; const status = document.createElement('b'); status.textContent = ({fail:'异常',warn:'注意',pass:'正常',unknown:'待核验'})[check.status]; item.append(dot, name, value, status); container.append(item); }); $('#inspection-total').textContent = `${counts.fail} 异常 · ${counts.warn} 注意 · ${counts.unknown} 待核验`; }
+  const container = $('#inspection-checks'); container.replaceChildren();
+  const checks = state.data?.compliance?.checks || [];
+  if (!checks.length) { container.append(Object.assign(document.createElement('p'), { className:'empty', textContent:'采集后显示基础环境检查。' })); return; }
+  const counts = { fail:0, warn:0, pass:0, unknown:0 };
+  checks.forEach((check) => {
+    counts[check.status] = (counts[check.status] || 0) + 1;
+    const item = document.createElement('button'); item.className = `check-item ${check.status}`;
+    item.title = `${check.name}: ${check.value}${check.detail ? `\n${check.detail}` : ''}`;
+    const dot = document.createElement('i'); const name = document.createElement('strong'); name.textContent = check.name;
+    const value = document.createElement('span'); value.textContent = check.value;
+    const status = document.createElement('b'); status.textContent = ({fail:'异常',warn:'注意',pass:'正常',unknown:'待核验'})[check.status];
+    item.append(dot, name, value, status); container.append(item);
+  });
+  $('#inspection-total').textContent = `${counts.fail} 异常 · ${counts.warn} 注意 · ${counts.unknown} 待核验`;
+  renderNorthboundCheck(container);
+}
 function renderDevices() {
   const list = $('#device-list'); list.replaceChildren();
   if (!state.data) return list.append(Object.assign(document.createElement('p'), { className: 'empty', textContent: '尚无采集结果' }));
@@ -136,6 +169,20 @@ function renderDevices() {
   Object.entries(groups).forEach(([type, label]) => { const items = ordered.filter((node) => node.type === type); if (!items.length) return; const details = document.createElement('details'); details.className = 'device-group'; details.open = type === 'cpu' || items.some((node) => node.id === state.selected || node.status === 'invalid'); const summary = document.createElement('summary'); summary.innerHTML = `<span>${label}</span><b>${items.length}</b>`; details.append(summary); items.forEach((node) => { const slowNic = node.type === 'nic' && !node.nicInfo?.isManagement && node.nicInfo?.speedGbps > 0 && node.nicInfo.speedGbps < 100; const button = document.createElement('button'); button.className = `device-item ${node.status === 'invalid' ? 'invalid' : ''} ${node.id === state.selected ? 'selected' : ''} ${node.nicInfo?.isManagement ? 'management' : ''} ${slowNic ? 'slow-nic' : ''}`; button.onclick = () => selectNode(node.id); button.title = deviceMeta(node); const icon = document.createElement('span'); icon.className = `device-icon ${node.type}`; icon.textContent = node.nicInfo?.isManagement ? 'MGT' : deviceIcon(node.type); const labels = document.createElement('span'); const name = document.createElement('span'); name.className = 'device-name'; name.textContent = node.label; if (node.nicInfo?.isManagement) { const tag = document.createElement('em'); tag.className = 'device-tag management-tag'; tag.textContent = '管理'; name.append(tag); } if (slowNic) { const tag = document.createElement('em'); tag.className = 'device-tag warning-tag'; tag.textContent = '<100G'; name.append(tag); } if (node.issues?.length) { const flag = document.createElement('b'); flag.className = 'issue-count'; flag.textContent = node.issues.length; name.append(flag); } const meta = document.createElement('span'); meta.className = 'device-meta'; meta.textContent = deviceMeta(node); labels.append(name, meta); button.append(icon, labels); details.append(button); }); list.append(details); });
 }
 function addField(parent, term, value, code = false) { const row = document.createElement('div'); const dt = document.createElement('dt'); dt.textContent = term; const dd = document.createElement('dd'); if (code) { const c = document.createElement('code'); c.textContent = value; dd.append(c); } else dd.textContent = value; row.append(dt, dd); parent.append(row); }
+function gpuVersionFields(data) {
+  const gpuInfo = (data?.nodes || []).filter((node) => node.type === 'gpu').map((node) => node.gpuInfo || {});
+  const uniqueValues = (values) => [...new Set(values.filter(Boolean))];
+  const models = uniqueValues([...(data?.compliance?.gpu?.models || []), ...gpuInfo.map((item) => item.model)]);
+  const maca = uniqueValues(gpuInfo.map((item) => item.maca));
+  const vbios = uniqueValues(gpuInfo.map((item) => item.vbios));
+  const macaText = maca.length
+    ? `${maca.join(' / ')}${vbios.length ? `（VBIOS ${vbios.join(' / ')}）` : ''}`
+    : '未检测到';
+  return [
+    ['GPU 型号', models.join(' / ') || '未检测到', false],
+    ['GPU MACA 版本', macaText, true]
+  ];
+}
 function renderDetail() {
   const target = $('#detail'); target.replaceChildren(); const node = state.data?.nodes.find((item) => item.id === state.selected); if (!node) return target.append(Object.assign(document.createElement('p'), { className: 'empty', textContent: '在左侧设备列表或图中选择设备。' }));
   const badge = document.createElement('span'); badge.className = `badge ${node.status === 'invalid' ? 'invalid' : ''}`; badge.textContent = node.status === 'invalid' ? `${deviceIcon(node.type)} · 待处理` : `${deviceIcon(node.type)} · 已检查`; const title = document.createElement('h3'); title.textContent = node.label;
@@ -271,7 +318,107 @@ function renderGraph() {
   });
 }
 function renderOutput() { const text = state.data?.diagnostics?.[state.output] || '尚无输出'; $('#terminal').textContent = text || '目标机器未安装或未找到该工具。'; document.querySelectorAll('.tabs button').forEach((button) => button.classList.toggle('active', button.dataset.output === state.output)); }
-function renderAll() { renderHeader(); renderInspection(); renderDevices(); renderDetail(); renderGraph(); renderOutput(); }
+function renderMachineFacts() {
+  const list = $('#machine-facts');
+  list.replaceChildren();
+  $('#machine-facts-host').textContent = state.data?.hostname || '-';
+  const machine = state.data?.machine;
+  if (!machine) {
+    list.append(Object.assign(document.createElement('p'), { className:'empty', textContent:'采集后显示机器配置。' }));
+    return;
+  }
+  addField(list, '整机型号', machine.productName || '未检测到');
+  addField(list, 'CPU 型号', machine.model || '未检测到');
+  addField(list, 'CPU 规格', `${machine.sockets ?? '?'} 路 · ${machine.coresPerSocket ?? '?'} 核/路 · ${machine.logicalCpus ?? '?'} 逻辑 CPU`);
+  gpuVersionFields(state.data).forEach(([term, value, code]) => addField(list, term, value, code));
+  addField(list, '内存容量', machine.memoryKb ? `${Math.round(machine.memoryKb / 1024 / 1024)} GiB` : '未检测到');
+  addField(list, '架构', machine.architecture || machine.systemArch || '未检测到', true);
+  addField(list, '操作系统', machine.os || '未检测到');
+  addField(list, '内核', machine.kernel || '未检测到', true);
+}
+function isC600UlMachine(data = state.data) {
+  const models = gpuVersionFields(data).find(([term]) => term === 'GPU 型号')?.[1] || '';
+  return models !== '未检测到' && models.split('/').some((model) => model.toUpperCase().replace(/[^A-Z0-9]/g, '').includes('C600UL'));
+}
+const NORTHBOUND_BADGES = { idle:'待检测', checking:'检测中', repairing:'修复中', normal:'正常', error:'路由错误', unknown:'待核验', failed:'执行失败' };
+const NORTHBOUND_CLASSES = { idle:'unknown', checking:'unknown', repairing:'unknown', normal:'pass', error:'fail', unknown:'unknown', failed:'fail' };
+function northboundFirstLine() {
+  return (state.northbound.output || '').split('\n')
+    .map((item) => item.trim())
+    .find((item) => item && item !== '[stderr]' && !item.startsWith('$ ')) || '';
+}
+function northboundOutputText() {
+  return (state.northbound.output || '').split('\n').filter((line) => !line.trim().startsWith('$ ')).join('\n').trim();
+}
+function northboundSummary() {
+  const status = state.northbound.status;
+  if (status === 'checking') return '正在检测北向路由…';
+  if (status === 'repairing') return '正在下发修复命令…';
+  if (status === 'normal') return '北向路由正常';
+  if (status === 'error') return '北向路由错误，点击可修复';
+  if (status === 'failed') return `执行失败：${northboundFirstLine() || '点击重试'}`;
+  if (status === 'unknown') return '状态待核验，点击重新检测';
+  return '点击检测北向路由状态';
+}
+function renderNorthboundCheck(container) {
+  if (!isC600UlMachine()) return;
+  const status = state.northbound.status;
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.className = `check-item ${NORTHBOUND_CLASSES[status] || 'unknown'}`;
+  const outputText = northboundOutputText();
+  item.title = `${northboundSummary()}${outputText ? `\n\n${outputText}` : ''}`;
+  const dot = document.createElement('i');
+  const name = document.createElement('strong'); name.textContent = '北向网络测试';
+  const value = document.createElement('span'); value.textContent = northboundSummary();
+  const badge = document.createElement('b'); badge.textContent = NORTHBOUND_BADGES[status] || '待检测';
+  item.append(dot, name, value, badge);
+  item.addEventListener('click', () => {
+    if (state.northbound.running) return;
+    if (state.northbound.status === 'error') {
+      if (window.confirm('检测到北向路由错误。修复命令会重启目标机器，是否现在修复？')) runNorthbound('repair');
+      return;
+    }
+    runNorthbound('check');
+  });
+  container.append(item);
+}
+async function runNorthbound(action) {
+  if (state.northbound.running) return;
+  state.northbound.running = true;
+  state.northbound.status = action === 'repair' ? 'repairing' : 'checking';
+  state.northbound.output = action === 'repair'
+    ? '正在下发修复命令（会重启机器，请保持页面连接）…'
+    : '正在通过 BMC 读取北向路由状态…';
+  renderInspection();
+  const target = currentTestTarget(true, '#password');
+  if (target.kind === 'local') {
+    const password = $('#password').value || state.auth.localSudoPassword;
+    if (password) target.password = password;
+  }
+  try {
+    const response = await fetch('/api/northbound', {
+      method:'POST', headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ action, confirm: action === 'repair', target })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `请求失败（HTTP ${response.status}）。`);
+    let output = payload.output || '(命令无输出)';
+    if (action === 'repair' && (payload.exitCode === 0 || payload.exitCode === null)) {
+      output += '\n修复命令已下发；如果机器重启，请等待恢复后重新检测确认北向路由状态。';
+    }
+    state.northbound.output = output;
+    const commandFailed = Number.isInteger(payload.exitCode) && payload.exitCode !== 0;
+    state.northbound.status = commandFailed ? 'failed' : (action === 'repair' ? 'unknown' : (payload.state || 'unknown'));
+  } catch (error) {
+    state.northbound.status = 'failed';
+    state.northbound.output = `${error.message}\n如果目标机器正在重启，请等待其恢复后重新检测。`;
+  } finally {
+    state.northbound.running = false;
+    renderInspection();
+  }
+}
+function renderAll() { renderHeader(); renderMachineFacts(); renderInspection(); renderDevices(); renderDetail(); renderGraph(); renderOutput(); }
 function graphPoint(event) { const graph = $('#graph'); const rect = graph.getBoundingClientRect(); return { x:(event.clientX - rect.left) * state.graphWidth / rect.width, y:(event.clientY - rect.top) * state.graphHeight / rect.height }; }
 function beginNodeDrag(event, id) { event.stopPropagation(); const point = graphPoint(event); state.gesture = { kind:'node', id, pointerId:event.pointerId, start:point, origin:{ ...state.positions.get(id) }, moved:false }; $('#graph').setPointerCapture?.(event.pointerId); }
 function resetView(resetLayout = false) { state.view = { x:0, y:0, zoom:1 }; if (resetLayout) state.positions = null; renderGraph(); }
@@ -321,8 +468,15 @@ async function scan(useRoot = false) {
     const response = await fetch('/api/scan', { method:'POST', headers:{ 'Content-Type':'application/json', Accept:'application/x-ndjson' }, body:requestBody });
     const data = await readScanResponse(response);
     if (body.kind === 'remote' && password) rememberRemotePassword(body, password);
+    else if (body.kind === 'local' && useRoot && password) state.auth.localSudoPassword = password;
     state.data = data; state.selected = data.nodes[0]?.id || null; state.positions = null; state.collapsed = new Set(); state.view = { x:0, y:0, zoom:1 };
+    state.northbound = { running:false, status:'idle', output:'' };
+    updateSingleConnectState();
     renderAll(); renderTests(true); renderEp(); finishLoading(true);
+    const autoNorthbound = isC600UlMachine() && (body.kind === 'remote'
+      ? Boolean(password || cachedRemotePassword(body))
+      : Boolean(state.auth.localSudoPassword || $('#password').value));
+    if (autoNorthbound) runNorthbound('check');
   } catch (error) { displayError(error.message); finishLoading(false); }
 }
 
@@ -334,8 +488,25 @@ function testStatus(status = 'idle') {
   return ({ idle:'待测试', running:'运行中', passed:'通过', failed:'失败', stopped:'已停止' })[status] || '待测试';
 }
 
+function updateSingleConnectState() {
+  const connected = Boolean(state.data);
+  $('#single-page').classList.toggle('pre-connect', !connected);
+  $('#single-connect-heading').hidden = connected;
+  if (!state.scanLoading) {
+    const labels = scanButtonLabels();
+    ['scan', 'root-scan'].forEach((id) => { $(`#${id}`).querySelector('.button-label').textContent = labels[id]; });
+  }
+}
+
+function updateClusterConnectState() {
+  const connected = Boolean(state.cluster.data);
+  $('#cluster-page').classList.toggle('pre-connect', !connected);
+  $('#cluster-connect-heading').hidden = connected;
+}
+
 function switchPage(page) {
-  state.page = page === 'cluster' ? 'cluster' : 'single';
+  state.page = ['home', 'single', 'cluster'].includes(page) ? page : 'home';
+  $('#home-page').hidden = state.page !== 'home';
   $('#single-page').hidden = state.page !== 'single';
   $('#cluster-page').hidden = state.page !== 'cluster';
   document.querySelectorAll('.page-tabs button').forEach((button) => {
@@ -345,11 +516,15 @@ function switchPage(page) {
     button.tabIndex = active ? 0 : -1;
   });
   if (state.page === 'single') {
-    switchSingleView(state.singleView);
-    if (state.data) renderHeader(); else setTopConnection('', '等待采集');
-  } else {
+    updateSingleConnectState();
+    switchSingleView(state.data ? state.singleView : 'info');
+    if (state.data) renderHeader(); else setTopConnection('', '等待连接');
+  } else if (state.page === 'cluster') {
+    updateClusterConnectState();
     renderCluster();
     syncClusterConnection();
+  } else {
+    setTopConnection('', '选择巡检模式');
   }
 }
 
@@ -541,6 +716,7 @@ function renderClusterDetail() {
   addField(facts, '整机型号', data.machine?.productName || '未检测到');
   addField(facts, 'CPU 型号', data.machine?.model || '未检测到');
   addField(facts, 'CPU 规格', `${data.machine?.sockets ?? '?'} 路 · ${data.machine?.coresPerSocket ?? '?'} 核/路 · ${data.machine?.logicalCpus ?? '?'} 逻辑 CPU`);
+  gpuVersionFields(data).forEach(([term, value, code]) => addField(facts, term, value, code));
   addField(facts, '内存容量', data.machine?.memoryKb ? `${Math.round(data.machine.memoryKb / 1024 / 1024)} GiB` : '未检测到');
   addField(facts, '架构', data.machine?.architecture || data.machine?.systemArch || '未检测到', true);
   addField(facts, '操作系统', data.machine?.os || '未检测到');
@@ -662,6 +838,7 @@ async function runClusterScan() {
     const data = await readClusterResponse(response);
     state.cluster.data = data; state.cluster.error = '';
     state.cluster.selected = data.nodes[0]?.host || null;
+    updateClusterConnectState();
     if (body.password) {
       data.nodes.filter((node) => node.success).forEach((node) => rememberRemotePassword({ ...body, host:node.host }, body.password));
     }
@@ -683,6 +860,7 @@ function openClusterNodeInSinglePage() {
   const node = state.cluster.data?.nodes.find((item) => item.host === state.cluster.selected);
   if (!node?.success) return;
   state.data = node.data; state.selected = node.data.nodes[0]?.id || null; state.positions = null; state.collapsed = new Set(); state.view = { x:0, y:0, zoom:1 };
+  state.northbound = { running:false, status:'idle', output:'' };
   state.kind = 'remote';
   $('#host').value = node.host;
   $('#user').value = $('#cluster-user').value.trim();
@@ -795,6 +973,74 @@ function knownContainerImages() {
   return Array.isArray(state.data?.containers?.images) ? state.data.containers.images : [];
 }
 
+function knownMacaInstallations() {
+  if (!targetMatchesInventory()) return [];
+  return Array.isArray(state.data?.macaInstallations) ? state.data.macaInstallations : [];
+}
+
+function macaEnvironmentKey(environment) {
+  return environment ? `${environment.kind}:${environment.runtime}:${environment.id}` : '';
+}
+
+function ensureMacaEnvironmentProbe() {
+  const environment = selectedTestEnvironment();
+  if (!environment) return Promise.resolve();
+  const key = macaEnvironmentKey(environment);
+  if (state.maca.probes.has(key)) return Promise.resolve();
+  if (state.maca.loadingKey === key) return state.maca.loadingPromise;
+  state.maca.loadingKey = key;
+  const hint = $('#test-maca-hint');
+  hint.textContent = `正在检测${environment.kind === 'container' ? '容器' : '镜像'}内的 MACA 版本…`;
+  state.maca.loadingPromise = fetch('/api/maca-versions', {
+    method:'POST', headers:{ 'Content-Type':'application/json' },
+    body: JSON.stringify({ environment: { kind:environment.kind, runtime:environment.runtime, id:environment.id }, target:currentTestTarget(true, '#test-password') })
+  }).then(async (response) => {
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `检测失败（HTTP ${response.status}）。`);
+    return { installations:Array.isArray(payload.installations) ? payload.installations : [], error:'' };
+  }).catch((error) => ({ installations:[], error:error.message }))
+    .then((result) => { state.maca.probes.set(key, result); return result; })
+    .finally(() => { state.maca.loadingKey = ''; state.maca.loadingPromise = null; });
+  return state.maca.loadingPromise;
+}
+
+function populateMacaOptions(reset = false) {
+  const select = $('#test-maca');
+  const hint = $('#test-maca-hint');
+  const previous = select.value;
+  const environment = selectedTestEnvironment();
+  let installations = knownMacaInstallations();
+  if (environment) {
+    const key = macaEnvironmentKey(environment);
+    const probe = state.maca.probes.get(key);
+    if (!probe) {
+      select.disabled = true;
+      select.replaceChildren(Object.assign(document.createElement('option'), { value:DEFAULT_MACA_PATH, textContent:'正在检测…' }));
+      hint.textContent = `正在检测${environment.kind === 'container' ? '容器' : '镜像'}内的 MACA 版本…`;
+      ensureMacaEnvironmentProbe().then(() => { populateMacaOptions(false); renderTestSelection(); });
+      return;
+    }
+    installations = probe.installations || [];
+    if (probe.error) hint.textContent = `检测失败：${probe.error}`;
+    else if (!installations.length) hint.textContent = `${environment.kind === 'container' ? '容器' : '镜像'}内未检测到 /opt/maca* 安装`;
+    else hint.textContent = `来自${environment.kind === 'container' ? '容器' : '镜像'}：检测到 ${installations.length} 个 MACA 安装`;
+  } else {
+    hint.textContent = installations.length ? `来自宿主机采集结果：检测到 ${installations.length} 个 MACA 安装` : '使用默认 /opt/maca';
+  }
+  select.disabled = false;
+  const items = installations.length ? installations : [{ path:DEFAULT_MACA_PATH, version:'', resolved:'' }];
+  select.replaceChildren(...items.map((item) => {
+    const option = document.createElement('option');
+    option.value = item.path;
+    const version = item.version || item.path.replace('/opt/', '');
+    option.textContent = item.path === DEFAULT_MACA_PATH
+      ? `${version}（默认 /opt/maca${item.resolved && item.resolved !== DEFAULT_MACA_PATH ? ` → ${item.resolved}` : ''}）`
+      : `${version}（${item.path}）`;
+    return option;
+  }));
+  select.value = !reset && items.some((item) => item.path === previous) ? previous : items[0].path;
+}
+
 function selectedTestEnvironment() {
   const option = $('#test-container').selectedOptions[0];
   if (!option?.dataset.environmentKind || !option.dataset.runtime || !option.dataset.resourceId) return null;
@@ -882,6 +1128,7 @@ function populateTestContainerOptions(reset = false) {
 
 function populateTestDeviceOptions(reset = false) {
   populateTestContainerOptions(reset);
+  populateMacaOptions(reset);
   const gpuDevices = knownGpuDevices();
   const p2pGpus = gpuDevices.length ? gpuDevices : [
     { value:'0', index:0, node:null, label:'GPU 0' },
@@ -901,6 +1148,18 @@ function populateTestDeviceOptions(reset = false) {
     ? previousP2pGpuB
     : (p2pGpus[1]?.value || p2pGpus[0].value);
   refreshP2pNicOptions(reset, hcaDevices);
+
+  const previousPcieGpuA = $('#test-pcie-gpu-a').value;
+  const previousPcieGpuB = $('#test-pcie-gpu-b').value;
+  ['a', 'b'].forEach((endpoint) => {
+    const select = $(`#test-pcie-gpu-${endpoint}`);
+    select.replaceChildren(...p2pGpus.map((gpu) => Object.assign(document.createElement('option'), { value:gpu.value, textContent:gpu.label })));
+  });
+  $('#test-pcie-gpu-a').value = !reset && p2pGpus.some((gpu) => gpu.value === previousPcieGpuA) ? previousPcieGpuA : p2pGpus[0].value;
+  $('#test-pcie-gpu-b').value = !reset && p2pGpus.some((gpu) => gpu.value === previousPcieGpuB)
+    ? previousPcieGpuB
+    : (p2pGpus[1]?.value || p2pGpus[0].value);
+  updatePcieGpuRelation();
 
   const gpuOptions = $('#test-gpu-options');
   const hadGpuOptions = Boolean(gpuOptions.querySelector('input'));
@@ -939,7 +1198,6 @@ function populateTestDeviceOptions(reset = false) {
     nicOptions.replaceChildren(Object.assign(document.createElement('p'), { className:'selector-empty', textContent:'采集拓扑后显示 RDMA HCA' }));
   }
   updateTestNicSummary();
-  if (reset && Number(state.data?.summary?.gpus) >= 2) $('#test-gpu-count').value = String(state.data.summary.gpus);
 }
 
 function p2pDeviceDistance(gpuValue, nicValue) {
@@ -1025,6 +1283,55 @@ function updateP2pDistanceOutputs() {
     output.className = `p2p-distance ${distance.score <= 1 ? 'near' : distance.score <= 3 ? 'far' : ''}`.trim();
   });
   $('#test-p2p-gdr-hint').textContent = `两端通过 localhost 建立连接；${p2pGdrSelection().label}。`;
+}
+
+function gpuPairRelation(gpuA, gpuB) {
+  const unknown = { metaxLink:false, metaxLabel:'', pcieCode:'N/A', pcieDetail:'拓扑映射未知' };
+  if (!targetMatchesInventory()) return unknown;
+  const nodeById = new Map((state.data?.nodes || []).map((node) => [node.id, node]));
+  const parentById = new Map((state.data?.edges || []).map((edge) => [edge.source, edge.target]));
+  const gpuDevices = knownGpuDevices();
+  const nodeA = gpuDevices.find((item) => item.index === Number(gpuA))?.node;
+  const nodeB = gpuDevices.find((item) => item.index === Number(gpuB))?.node;
+  const pcieRelation = nodeA && nodeB ? selectedDeviceRelation([nodeA, nodeB], parentById, nodeById) : '拓扑映射未知';
+  const link = (Array.isArray(state.data?.gpuLinks) ? state.data.gpuLinks : [])
+    .filter((item) =>
+      (Number(item.source) === Number(gpuA) && Number(item.target) === Number(gpuB))
+      || (Number(item.source) === Number(gpuB) && Number(item.target) === Number(gpuA)))
+    .find((item) => /^(X|PIX|PXB|NODE|SYS|MX[0-9]*|MXLK|NV[0-9]+|PHB)$/.test(String(item.label || '').toUpperCase()));
+  if (!link) return { metaxLink:false, metaxLabel:'', pcieCode:'推断', pcieDetail:pcieRelation };
+  const raw = String(link.label || '').toUpperCase();
+  if (/^MX/.test(raw)) return { metaxLink:true, metaxLabel:raw, pcieCode:'推断', pcieDetail:pcieRelation };
+  const pcieDetail = raw === 'PIX' ? '同 PCIe Switch'
+    : raw === 'PXB' ? '同 PCIe Root Complex'
+      : raw === 'NODE' ? '同 NUMA'
+        : raw === 'SYS' ? '跨 NUMA'
+          : pcieRelation;
+  return { metaxLink:false, metaxLabel:'', pcieCode:raw || 'N/A', pcieDetail };
+}
+
+function gpuPairDistance(gpuA, gpuB) {
+  const relation = gpuPairRelation(gpuA, gpuB);
+  if (relation.metaxLink) return { ...relation, code:relation.metaxLabel, detail:'MetaXLink', score:0 };
+  const score = relation.pcieCode === 'PIX' ? 0 : relation.pcieCode === 'PXB' ? 1 : relation.pcieCode === 'NODE' ? 2 : relation.pcieCode === 'SYS' ? 3 : relation.pcieCode === '推断' ? 5 : 9;
+  return { ...relation, code:relation.pcieCode, detail:relation.pcieDetail, score };
+}
+
+function updatePcieGpuRelation() {
+  const output = $('#test-pcie-distance');
+  if (!output) return;
+  const gpuA = Number($('#test-pcie-gpu-a').value);
+  const gpuB = Number($('#test-pcie-gpu-b').value);
+  const relation = gpuPairRelation(gpuA, gpuB);
+  const collected = targetMatchesInventory();
+  const metaxText = relation.metaxLink ? `有（${relation.metaxLabel}）` : collected ? '无' : '待采集';
+  const pcieText = relation.pcieDetail === '拓扑映射未知' ? '待采集' : `${relation.pcieCode}（${relation.pcieDetail}）`;
+  output.textContent = `MetaXLink：${metaxText} · PCIe 距离：${pcieText}`;
+  output.className = `p2p-distance ${relation.metaxLink || relation.pcieCode === 'PIX' ? 'near' : ['PXB','NODE','SYS'].includes(relation.pcieCode) ? 'far' : ''}`.trim();
+  const pathSelect = $('#test-pcie-path');
+  const metaxOption = pathSelect?.querySelector('option[value="metaxlink"]');
+  if (metaxOption) metaxOption.disabled = collected && !relation.metaxLink;
+  if (pathSelect && collected && !relation.metaxLink && pathSelect.value === 'metaxlink') pathSelect.value = 'pcie';
 }
 
 function selectedTestGpus() {
@@ -1134,7 +1441,7 @@ function renderSelectedTopologyGraph(selectedNodes) {
     group.append(title, meta); nodesLayer.append(group);
   });
   svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-  svg.setAttribute('aria-label', `所选 ${selectedNodes.length} 个 GPU/网卡设备的 PCIe 拓扑关系`);
+  svg.setAttribute('aria-label', `所选 ${selectedNodes.length} 个设备的 PCIe 拓扑关系`);
   svg.append(edgesLayer, nodesLayer);
   svg.hidden = false;
   empty.hidden = true;
@@ -1152,16 +1459,22 @@ function renderTestTopology(definition, params = testParams()) {
   const dialogDetail = $('#test-topology-dialog-detail');
   const relation = $('#test-topology-relation');
   const empty = $('#test-topology-empty');
+  const needsNics = definition.fields.includes('nics');
+  $('#test-topology-legend-nic').hidden = !needsNics;
   if (!targetMatchesInventory()) {
     detail.textContent = '当前执行目标尚未采集';
     dialogDetail.textContent = '当前执行目标尚未采集';
     relation.textContent = '待采集'; relation.className = 'unknown';
-    empty.textContent = '请先采集当前目标，再选择 GPU 和 RDMA HCA 查看连接关系。';
+    empty.textContent = needsNics ? '请先采集当前目标，再选择 GPU 和 RDMA HCA 查看连接关系。' : '请先采集当前目标，再选择 GPU 查看连接关系。';
     renderSelectedTopologyGraph([]);
     return;
   }
-  const gpuValues = definition.id === 'nic-p2p' ? [params.gpuA, params.gpuB] : params.gpus;
-  const nicValues = definition.id === 'nic-p2p' ? [params.nicA, params.nicB] : params.nics;
+  const gpuValues = definition.id === 'nic-p2p' ? [params.gpuA, params.gpuB]
+    : definition.id === 'pcie-p2p' ? [params.pcieGpuA, params.pcieGpuB]
+      : params.gpus;
+  const nicValues = needsNics
+    ? (definition.id === 'nic-p2p' ? [params.nicA, params.nicB] : params.nics)
+    : [];
   const gpuDevices = knownGpuDevices();
   const hcaDevices = knownHcaDevices();
   const gpuNodes = gpuValues.map((value) => gpuDevices.find((item) => item.index === Number(value))?.node).filter(Boolean);
@@ -1174,13 +1487,18 @@ function renderTestTopology(definition, params = testParams()) {
     const distanceB = p2pDeviceDistance(params.gpuB, params.nicB);
     detail.textContent = `A: GPU ${params.gpuA} / ${params.nicA || '未选择'} · B: GPU ${params.gpuB} / ${params.nicB || '未选择'}`;
     dialogDetail.textContent = `端点 A ${distanceA.code}（${distanceA.detail}） · 端点 B ${distanceB.code}（${distanceB.detail}）`;
+  } else if (definition.id === 'pcie-p2p') {
+    const distance = gpuPairDistance(params.pcieGpuA, params.pcieGpuB);
+    const metaxText = distance.metaxLink ? `MetaXLink ${distance.metaxLabel}` : '无 MetaXLink';
+    detail.textContent = `GPU ${params.pcieGpuA} ↔ GPU ${params.pcieGpuB} · ${metaxText}`;
+    dialogDetail.textContent = `${detail.textContent} · PCIe 距离 ${distance.pcieCode}（${distance.pcieDetail}）`;
   } else {
-    detail.textContent = `${gpuValues.length} 张 GPU · ${nicValues.length} 个 RDMA HCA`;
+    detail.textContent = needsNics ? `${gpuValues.length} 张 GPU · ${nicValues.length} 个 RDMA HCA` : `${gpuValues.length} 张 GPU · PCIe/MetaXLink 拓扑`;
     dialogDetail.textContent = detail.textContent;
   }
-  if (!gpuValues.length || !nicValues.filter(Boolean).length) {
+  if (!gpuValues.length || (needsNics && !nicValues.filter(Boolean).length)) {
     relation.textContent = '选择未完成'; relation.className = 'warning';
-    empty.textContent = '请至少选择所需的 GPU 和 RDMA HCA。';
+    empty.textContent = needsNics ? '请至少选择所需的 GPU 和 RDMA HCA。' : '请至少选择所需的 GPU。';
   } else if (missingGpuCount || missingNicCount) {
     relation.textContent = '映射不完整'; relation.className = 'warning';
     empty.textContent = `采集结果缺少 ${missingGpuCount ? `${missingGpuCount} 张 GPU` : ''}${missingGpuCount && missingNicCount ? '、' : ''}${missingNicCount ? `${missingNicCount} 个 HCA` : ''} 的 PCIe 映射。`;
@@ -1192,6 +1510,12 @@ function renderTestTopology(definition, params = testParams()) {
       const distanceB = p2pDeviceDistance(params.gpuB, params.nicB);
       relation.textContent = `A ${distanceA.code} · B ${distanceB.code}`;
       relation.className = distanceA.score < 9 && distanceB.score < 9 ? 'ready' : 'warning';
+    } else if (definition.id === 'pcie-p2p') {
+      const distance = gpuPairDistance(params.pcieGpuA, params.pcieGpuB);
+      relation.textContent = distance.metaxLink
+        ? `MetaXLink ${distance.metaxLabel} · PCIe ${distance.pcieCode}`
+        : `PCIe ${distance.pcieCode} · ${distance.pcieDetail}`;
+      relation.className = distance.score < 9 ? 'ready' : 'warning';
     } else {
       relation.textContent = selectedDeviceRelation(selectedNodes, parentById, nodeById);
       relation.className = 'ready';
@@ -1206,15 +1530,18 @@ function testParams() {
   return {
     gpuA: Number($('#test-p2p-gpu-a').value),
     gpuB: Number($('#test-p2p-gpu-b').value),
+    pcieGpuA: Number($('#test-pcie-gpu-a').value),
+    pcieGpuB: Number($('#test-pcie-gpu-b').value),
+    pciePath: $('#test-pcie-path').value,
     nicA: $('#test-p2p-nic-a').value,
     nicB: $('#test-p2p-nic-b').value,
     gpus: selectedTestGpus(),
-    gpuCount: Number($('#test-gpu-count').value || 2),
     nic: $('#test-hca').value.trim(),
     nics: selectedTestNics(),
     transport: $('#test-transport').value,
     gidIndex: Number($('#test-gid').value || 0),
     gdrMode,
+    macaPath: $('#test-maca').value || DEFAULT_MACA_PATH,
     containerRuntime: environment?.kind === 'container' ? environment.runtime : '',
     containerId: environment?.kind === 'container' ? environment.id : '',
     imageRuntime: environment?.kind === 'image' ? environment.runtime : '',
@@ -1233,14 +1560,17 @@ function testCommandPreview(definition, params = testParams()) {
   const p2pGdrLabel = params.gdrMode === 'dmabuf'
     ? 'DMA-BUF（追加 --use_maca_dmabuf）'
     : params.gdrMode === 'peermem' ? 'PEERMEM（不追加 --use_maca_dmabuf）' : '运行时自动检测 DMA-BUF / PEERMEM';
+  const pciePathEnv = params.pciePath === 'pcie' ? 'USE_PCIE_FIRST=1 '
+    : params.pciePath === 'metaxlink' ? 'USE_PCIE_FIRST=0 ' : '';
+  const paths = macaPaths(params.macaPath);
   const commands = {
-    'gpu-vector-add': `for gpu in ${params.gpus.length ? params.gpus.join(' ') : '<GPU>'}; do MACA_VISIBLE_DEVICES=$gpu vectorAdd; done`,
-    'nic-p2p': `GDR: ${p2pGdrLabel}\nserver: ${IB_WRITE_BW_PATH} -a${p2pOptions} -d ${params.nicA || '<HCA_A>'} --use_maca=${Number.isInteger(params.gpuA) ? params.gpuA : '<GPU_A>'}${gid} -p <AUTO_PORT>${p2pGdrOption} &\nclient: ${IB_WRITE_BW_PATH} -a${p2pOptions} -d ${params.nicB || '<HCA_B>'} --use_maca=${Number.isInteger(params.gpuB) ? params.gpuB : '<GPU_B>'}${gid} -p <AUTO_PORT> localhost${p2pGdrOption}`,
-    'nic-alltoall': `MACA_VISIBLE_DEVICES=${gpuRange} MCCL_IB_HCA=${nicRange}${params.transport === 'RoCE' ? ` MCCL_IB_GID_INDEX=${params.gidIndex}` : ''} MCCL_IB_DISABLE=0 MCCL_NET_DISABLE_INTRA=0 MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1 ${MACA_MPIRUN_PATH} -n ${params.gpus.length || '<N>'} ${MCCL_ALLTOALL_PATH}`,
-    'host-ibrc': `MCCL_P2P_LEVEL=LOC MCCL_IB_HCA=${params.nic || '<HCA>'} mpirun -n ${params.gpuCount} alltoall_perf`,
-    'host-ibgda': `MXSHMEM_DISABLE_P2P=1 MXSHMEM_HCA_LIST=${params.nic || '<HCA>'}:1 python test_internode.py -n ${params.gpuCount}`
+    'gpu-vector-add': `for gpu in ${params.gpus.length ? params.gpus.join(' ') : '<GPU>'}; do MACA_VISIBLE_DEVICES=$gpu vectorAdd & done; wait`,
+    'nic-p2p': `GDR: ${p2pGdrLabel}\nserver: ${paths.ibWrite} -a${p2pOptions} -d ${params.nicA || '<HCA_A>'} --use_maca=${Number.isInteger(params.gpuA) ? params.gpuA : '<GPU_A>'}${gid} -p <AUTO_PORT>${p2pGdrOption} &\nclient: ${paths.ibWrite} -a${p2pOptions} -d ${params.nicB || '<HCA_B>'} --use_maca=${Number.isInteger(params.gpuB) ? params.gpuB : '<GPU_B>'}${gid} -p <AUTO_PORT> localhost${p2pGdrOption}`,
+    'nic-alltoall': `MACA_VISIBLE_DEVICES=${gpuRange} MCCL_IB_HCA=${nicRange}${params.transport === 'RoCE' ? ` MCCL_IB_GID_INDEX=${params.gidIndex}` : ''} MCCL_IB_DISABLE=0 MCCL_NET_DISABLE_INTRA=0 MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1 ${paths.mpirun} -n ${params.gpus.length || '<N>'} ${paths.alltoall}`,
+    'pcie-p2p': `${pciePathEnv}MACA_VISIBLE_DEVICES=${Number.isInteger(params.pcieGpuA) ? params.pcieGpuA : '<GPU_A>'},${Number.isInteger(params.pcieGpuB) ? params.pcieGpuB : '<GPU_B>'} P2P_MODE=1 ${paths.bench} p2p`,
+    'pcie-alltoall': `MACA_VISIBLE_DEVICES=${gpuRange} MCCL_IB_DISABLE=1 MCCL_SHM_DISABLE=1 MCCL_P2P_LEVEL=SYS MCCL_NET_DISABLE_INTRA=1 ${paths.mpirun} -n ${params.gpus.length || '<N>'} ${paths.alltoall} -b 1M -e 256M -f 2 -g 1 -n 5`
   };
-  const command = `${MACA_LIBRARY_PATH_PREVIEW}\n${commands[definition.id] || '-'}`;
+  const command = `export LD_LIBRARY_PATH=${paths.base}/lib:$LD_LIBRARY_PATH\n${commands[definition.id] || '-'}`;
   const environment = selectedTestEnvironment();
   if (environment?.kind === 'container') return `${environment.runtime} exec -i ${environment.id.slice(0, 12)} bash -s · ${command}`;
   if (environment?.kind === 'image') return `${environment.runtime} run --rm -i [GPU/RDMA/host namespaces/privileged] ${environment.id.slice(0, 19)} bash -s · ${command}`;
@@ -1279,6 +1609,15 @@ function renderTestCatalog() {
 
 function defaultTestNote(definition) {
   if (!targetMatchesInventory()) return '建议先在“基本信息”页采集当前目标，以自动识别 GPU 和 HCA。';
+  if (definition.id === 'pcie-p2p') {
+    if (knownGpuDevices().length < 2) return 'P2P 需要至少两张 GPU。';
+    const params = testParams();
+    if (params.pcieGpuA === params.pcieGpuB) return 'P2P 两端必须选择不同 GPU。';
+    const relation = gpuPairRelation(params.pcieGpuA, params.pcieGpuB);
+    if (params.pciePath === 'metaxlink' && targetMatchesInventory() && !relation.metaxLink) return '所选两张 GPU 之间没有 MetaXLink，请选择 PCIe 或自动。';
+    const pathLabel = params.pciePath === 'pcie' ? '优先 PCIe' : params.pciePath === 'metaxlink' ? `优先 MetaXLink（${relation.metaxLabel}）` : relation.metaxLink ? `自动（存在 MetaXLink ${relation.metaxLabel}，优先走 MetaXLink）` : '自动（无 MetaXLink，走 PCIe）';
+    return `使用 TransferBench 测试所选两张 GPU 的传输带宽；${pathLabel}；PCIe 距离 ${relation.pcieCode}（${relation.pcieDetail}）。`;
+  }
   if (definition.id === 'nic-p2p') {
     const params = testParams();
     if (knownGpuDevices().length < 2) return 'P2P 本机互测需要至少两张 GPU。';
@@ -1288,10 +1627,11 @@ function defaultTestNote(definition) {
     return '将在当前目标内自动启动 P2P 服务端，并由另一端通过 localhost 发起测试；两端可使用同一个 RDMA HCA。';
   }
   if (definition.fields.includes('gpus') && !selectedTestGpus().length) return '请至少选择一张 GPU。';
-  if (definition.id === 'nic-alltoall' && selectedTestGpus().length < 2) return 'alltoall 至少需要选择两张 GPU。';
+  if ((definition.id === 'nic-alltoall' || definition.id === 'pcie-alltoall') && selectedTestGpus().length < 2) return 'alltoall 至少需要选择两张 GPU。';
   if (definition.fields.includes('hca') && !$('#test-hca').value.trim()) return '未发现 RDMA HCA，请检查 ibstat 或手动输入 HCA 名称。';
   if (definition.fields.includes('nics') && !selectedTestNics().length) return '请至少选择一个 RDMA HCA。';
   if (definition.id === 'nic-alltoall') return '固定使用 RDMA HCA 通路：禁用 PCIe/MetaXLink P2P 与 SHM，并按所选网络类型配置 MCCL。';
+  if (definition.id === 'pcie-alltoall') return '固定使用 PCIe/MetaXLink P2P 通路：禁用 RDMA 网络与 SHM，MCCL_P2P_LEVEL=SYS。';
   const environment = selectedTestEnvironment();
   if (environment?.kind === 'container') return `测试将在 ${containerRuntimeLabel(environment.runtime)} 容器 ${environment.label} 内执行，请确认 GPU 和 RDMA 设备已映射。`;
   if (environment?.kind === 'image') return `将由镜像 ${environment.label} 创建 privileged 临时容器，测试结束后自动删除。`;
@@ -1320,16 +1660,18 @@ function renderTestSelection() {
   $('#selected-test-description').textContent = definition.description;
   const status = $('#selected-test-status'); status.className = `test-status ${result.status}`; status.textContent = testStatus(result.status);
   const fields = new Set(definition.fields);
-  ['p2p','gpus','gpu-count','hca','nics','transport','gid'].forEach((name) => {
-    const key = name === 'gpu-count' ? 'gpuCount' : name;
-    $('#field-test-' + name).hidden = !fields.has(key) || (name === 'gid' && $('#test-transport').value === 'IB');
+  ['p2p','pcie-p2p','gpus','hca','nics','transport','gid','maca'].forEach((name) => {
+    $('#field-test-' + name).hidden = !fields.has(name) || (name === 'gid' && $('#test-transport').value === 'IB');
   });
-  $('#test-gpus-legend').textContent = definition.id === 'nic-alltoall' ? 'GPU 范围' : 'GPU 卡选择';
+  $('#test-gpus-legend').textContent = definition.id === 'nic-alltoall' || definition.id === 'pcie-alltoall' ? 'GPU 范围' : 'GPU 卡选择';
   $('#test-gpus-hint').textContent = definition.id === 'nic-alltoall'
     ? 'alltoall 将仅启动勾选的 GPU，每张 GPU 对应一个 MPI rank'
-    : 'vectorAdd 编译一次后，将依次在每张所选 GPU 上运行并汇总结果';
+    : definition.id === 'pcie-alltoall'
+      ? 'alltoall 将在所选 GPU 上通过 PCIe/MetaXLink P2P 通路运行，每张 GPU 对应一个 MPI rank'
+      : 'vectorAdd 编译一次后，将在每张所选 GPU 上并行运行并汇总结果';
   $('#field-test-password').hidden = state.kind !== 'remote' || Boolean(cachedRemotePassword(currentTestTarget()));
   updateP2pDistanceOutputs();
+  updatePcieGpuRelation();
   const params = testParams();
   $('#test-command-preview').textContent = testCommandPreview(definition, params);
   renderTestTopology(definition, params);
@@ -1406,11 +1748,16 @@ function validateTestRequest(definition, params, target) {
     if (params.gpuA === params.gpuB) return 'P2P 两端必须选择不同 GPU。';
     if (!params.nicA || !params.nicB) return '请为 P2P 两端分别选择 RDMA HCA。';
   }
+  if (definition.id === 'pcie-p2p') {
+    if (!Number.isInteger(params.pcieGpuA) || !Number.isInteger(params.pcieGpuB) || params.pcieGpuA < 0 || params.pcieGpuB < 0) return '请为 P2P 两端分别选择 GPU。';
+    if (params.pcieGpuA === params.pcieGpuB) return 'P2P 两端必须选择不同 GPU。';
+    const relation = gpuPairRelation(params.pcieGpuA, params.pcieGpuB);
+    if (params.pciePath === 'metaxlink' && targetMatchesInventory() && !relation.metaxLink) return '所选两张 GPU 之间没有 MetaXLink，请选择 PCIe 或自动。';
+  }
   if (definition.fields.includes('gpus') && !params.gpus.length) return '请至少选择一张 GPU。';
-  if (definition.id === 'nic-alltoall' && params.gpus.length < 2) return 'alltoall 至少需要选择两张 GPU。';
+  if ((definition.id === 'nic-alltoall' || definition.id === 'pcie-alltoall') && params.gpus.length < 2) return 'alltoall 至少需要选择两张 GPU。';
   if (definition.fields.includes('hca') && !params.nic) return '请选择或输入 RDMA HCA。';
   if (definition.fields.includes('nics') && !params.nics.length) return '请至少选择一个 RDMA HCA。';
-  if (definition.fields.includes('gpuCount') && (!Number.isInteger(params.gpuCount) || params.gpuCount < 2)) return 'GPU 数量至少为 2。';
   return '';
 }
 
@@ -2034,6 +2381,8 @@ function exportSingleEpCsv() {
 }
 
 document.querySelectorAll('.page-tabs button').forEach((button) => button.addEventListener('click', () => switchPage(button.dataset.page)));
+$('#home-single').addEventListener('click', () => switchPage('single'));
+$('#home-cluster').addEventListener('click', () => switchPage('cluster'));
 document.querySelectorAll('.single-tabs button').forEach((button) => button.addEventListener('click', () => switchSingleView(button.dataset.singleView)));
 $('#go-info').addEventListener('click', () => { switchPage('single'); switchSingleView('info'); });
 $('#ep-go-info').addEventListener('click', () => { switchPage('single'); switchSingleView('info'); });
@@ -2044,6 +2393,7 @@ document.querySelectorAll('#cluster-size button').forEach((button) => button.add
   $('#cluster-progress').classList.remove('complete', 'error');
   document.querySelectorAll('#cluster-size button').forEach((item) => item.classList.toggle('active', item === button));
   setClusterNote('仅执行只读采集；各机器并行连接，单台失败不会中断其他机器。');
+  updateClusterConnectState();
   renderCluster();
 }));
 $('#cluster-hosts').addEventListener('input', () => { updateClusterHostCount(); if (!state.cluster.data) renderClusterMachines(); });
@@ -2062,10 +2412,14 @@ $('#test-list').addEventListener('click', (event) => {
   if (!card || state.tests.running || state.ep.running) return;
   state.tests.selected = card.dataset.testId; renderTestCatalog(); renderTestSelection();
 });
-['test-container','test-gpu-count','test-hca','test-transport','test-gid'].forEach((id) => $(`#${id}`).addEventListener('input', renderTestSelection));
+['test-container','test-hca','test-transport','test-gid','test-pcie-path','test-maca'].forEach((id) => $(`#${id}`).addEventListener('input', renderTestSelection));
+$('#test-container').addEventListener('change', () => {
+  ensureMacaEnvironmentProbe().then(() => { populateMacaOptions(false); renderTestSelection(); });
+});
 ['a', 'b'].forEach((endpoint) => {
   $(`#test-p2p-gpu-${endpoint}`).addEventListener('change', () => { refreshP2pNicOptions(); renderTestSelection(); });
   $(`#test-p2p-nic-${endpoint}`).addEventListener('change', renderTestSelection);
+  $(`#test-pcie-gpu-${endpoint}`).addEventListener('change', () => { updatePcieGpuRelation(); renderTestSelection(); });
 });
 $('#test-gpu-options').addEventListener('change', () => { updateTestGpuSummary(); renderTestSelection(); });
 $('#test-gpu-select-all').addEventListener('click', () => setAllTestGpus(true));
@@ -2123,3 +2477,4 @@ resetEpLog();
 renderTests();
 renderEp();
 renderCluster();
+switchPage('home');

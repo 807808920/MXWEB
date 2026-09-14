@@ -114,3 +114,29 @@
     1.alltoall命令参考：MACA_VISIBLE_DEVICES=0,1 MCCL_IB_HCA=mlx5_0,mlx5_1 MCCL_IB_GID_INDEX=3 /opt/maca/ompi/bin/mpirun -n 2 /opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf
     2.是否跑网卡/PCIE/METAX需要参考：mccl环境变量.md
     根据以上两点修复网卡alltoall测试问题
+
+
+需求11：（v4.1flash）
+    vectorAdd多卡测试是串行测试比较慢，改成并行测试
+
+
+需求12：
+    基本功能测试中的单机通信改成Pcie/Metax测试，支持P2P测试和alltoall测试
+    P2P测试支持选择GPU和GPU 使用transforBanch程序测试,参考/opt/maca/samples/mccl_tests/benchmark目录
+    alltoall测试使用/opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf测试
+
+
+需求13：
+    调整首页，更方便选择单机巡检测试/集群巡检测试两个选项, 选择后用户给出ssh连接信息，连接后进入后再显示单机/集群的检查与测试页面
+
+
+需求14：
+    对于C600UL显卡机器，基础巡检里面增加北向网络测试(下面命令均需需要sudo权限)：
+    测试命令：ipmitool raw 0x3c 0x05 0x98 
+    如果返回00，代表北向路由错误，如果返回01，代表北向路由正常.
+    如果北向路由错误，可以通过以下命令进行修复(如果要修复要提升会重启机器，需要用户确认)：
+    ipmitool raw 0x3c 0x28 0xff 0xfc
+    ipmitool raw 0x3c 0x28 0xff 0xfd
+
+需求15：
+    单机基本功能测试增加maca版本选择，可以发现/opt下的maca版本供用户进行选择，相应的测试会更改MACA_PATH环境变量以及/opt/maca-xxx具体路径。

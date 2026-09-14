@@ -2,6 +2,12 @@
 
 面向 GPU 服务器的单机与小规模集群检查工具。它以只读命令采集 CPU/NUMA、GPU、NIC 和 PCIe Switch 的关系，并保留原始诊断输出供核对。
 
+## 使用流程
+
+1. 首页选择“单机巡检测试”或“集群巡检测试”。
+2. 在连接页填写目标信息：单机可选本机或远程 SSH；集群需选择 2/4/8 台机器并填写共用的 SSH 信息。
+3. 点击“连接并采集”（集群为“开始集群采集”）。采集成功后才会显示对应的单机/集群检查与测试页面；采集失败时停留在连接页，可修改信息后重试。
+
 ## 启动
 
 ```bash
@@ -51,7 +57,11 @@ PCIe Switch 的多个端口会归并到其上游 PEX/PLX Switch，避免把每�
 
 拓扑画布可使用鼠标滚轮缩放、拖动空白处平移、拖动设备节点调整布局；单击 `+`/`−` 按钮，或双击对应的 CPU / PCIe Switch 节点，可展开或折叠其全部下级节点。右上角控件可放大、缩小和恢复自动布局。缺失采集数据会显示为“未检测到”，不会被当作不合规项。
 
-设备清单会把管理网卡置顶并以绿色标记，其余网卡按链路 `up` 状态和速率降序排列；低于 100 Gbps 的非管理 RoCE/IB 网卡显示为红色。设备详情同时展示网卡角色、类型、速率和 IP，GPU 型号、HBM、频率、PCIe 号和使用率，CPU 下挂 PCIe Switch 数，以及每个 Switch 下挂的 GPU/NIC 数量和上行链路配置。
+设备清单会把管理网卡置顶并以绿色标记，其余网卡按链路 `up` 状态和速率降序排列；低于 100 Gbps 的非管理 RoCE/IB 网卡显示为红色。设备详情同时展示网卡角色、类型、速率和 IP，GPU 型号、HBM、频率、PCIe 号和使用率，CPU 下挂 PCIe Switch 数，以及每个 Switch 下挂的 GPU/NIC 数量和上行链路配置。单机“基本信息”页的“机器配置”区块汇总整机型号、CPU、GPU 型号、GPU MACA 版本（含 VBIOS）、内存、架构、操作系统与内核。
+
+## 北向网络测试
+
+C600UL 机型在单机“基本信息”页的“基础巡检”中会多出一个“北向网络测试”单元格。使用 Root 采集（或带密码的远程采集）成功后会自动检测一次并直接显示结果；也可以点击单元格手动检测，检测会以 sudo/root 权限在目标机器执行 `ipmitool raw 0x3c 0x05 0x98`：返回 `00` 判定为北向路由错误，返回 `01` 判定为正常；处于“路由错误”状态时再次点击会弹出确认，确认后执行 `ipmitool raw 0x3c 0x28 0xff 0xfc` 和 `ipmitool raw 0x3c 0x28 0xff 0xfd`。修复可能导致机器重启，页面会提示等待恢复后重新检测。本机执行复用 Root 采集时输入的密码完成 sudo 鉴权（连接栏中新输入的密码优先），远程执行复用当前 SSH 目标与页面内缓存的密码；未提供密码且无法免密 sudo 时会明确返回鉴权失败。
 
 Switch 的单/双上行结论基于当前操作系统可见的 PCIe 父链路；某些硬件的双上行被固件合并或仅记录在机型拓扑配置中时，页面会按“系统可见”结果展示，需结合整机硬件设计核验。
 
@@ -65,13 +75,15 @@ ACS、ATS、RO 和 MRRS 合并为一个 PCIe 控制巡检项，展示各状态�
 
 ## 基本功能测试
 
-顶部“单机检查与测试”中的“基本功能测试”二级 Tab 提供 5 个受控的测试配方：GPU vectorAdd、网卡 P2P、网卡 alltoall、单机 IBRC 和单机 IBGDA。页面会从最近一次采集结果自动填充 GPU 和 RDMA HCA，并实时显示标准输出、错误输出、退出状态和耗时。vectorAdd 可勾选任意多张 GPU，程序只编译一次，随后逐卡运行并汇总通过、失败结果。
+顶部“单机检查与测试”中的“基本功能测试”二级 Tab 提供 5 个受控的测试配方：GPU vectorAdd、网卡 P2P、网卡 alltoall、Pcie/Metax P2P 和 Pcie/Metax alltoall。页面会从最近一次采集结果自动填充 GPU 和 RDMA HCA，并实时显示标准输出、错误输出、退出状态和耗时。采集时会扫描 `/opt` 下的 `/opt/maca` 与 `/opt/maca-*` 安装，页面提供“MACA 版本”选择；当运行环境选择为运行中的容器或本地镜像时，页面会在选择后进入该容器（`exec`）或临时启动该镜像（`run --rm`）探测其中的 `/opt/maca*` 版本并显示，测试会以所选路径设置 `MACA_PATH`，并调用该目录下的 `mxcc`、perftest、`mpirun`、MCCL 示例和 TransferBench。vectorAdd 可勾选任意多张 GPU，程序只编译一次，随后在所有所选 GPU 上并行运行并汇总通过、失败结果。
 
 单机测试可在宿主机、已运行的 Docker/Podman/nerdctl 容器或本地镜像中执行。采集后页面会列出当前目标上可访问的容器和镜像；选择镜像时会按固定参数创建具备 GPU、RDMA 和主机网络访问权限的 privileged 临时容器，并使用 `--rm` 在测试结束后删除。
 
 测试服务只接受服务端预定义参数，不接受任意 Shell 命令。所有基本功能测试及 SingleEP 测试均会在启动程序前执行 `export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH`。每次启动都必须显式确认 GPU 空闲和性能影响；同一服务进程同时只允许一项性能测试。单项有 90–300 秒超时限制，日志上限为 4 MiB。点击停止、超时、日志超限或关闭页面时，服务端会使用每次运行的随机标识定向清理宿主机、远程机及已选容器内的本次测试进程，先发送 TERM，超时后发送 KILL，并等待退出确认；镜像测试则同时强制删除对应的临时容器。
 
 “网卡测试”包含 P2P 和 alltoall。P2P 在同一测试目标内选择两个不同 GPU，并为每张 GPU 分别选择 HCA（两端允许使用同一个 HCA）；HCA 选项使用 `mlx5_0,numa0,400G,up` 格式，所选 HCA 与 GPU 的 `PIX`、`PXB`、`NODE` 或 `SYS` 距离显示在端点卡片中。服务端自动启动端点 A，端点 B 通过 `localhost` 发起测试，并固定使用 `/opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw --use_maca=<GPU>`，无需填写对端地址，同时仍可选择 InfiniBand 或 RoCE（含 GID Index）。P2P 会根据采集结果及测试目标运行时的 `peer_mem`、内核/RDMA/libibverbs 能力自动选择 GDR 注册方式：PEERMEM 不添加额外参数；DMA-BUF 则在服务端和客户端命令末尾添加 `--use_maca_dmabuf`，若能力链路或程序选项不满足会在启动流量前明确失败。alltoall 可勾选多张 GPU 和多个 HCA，固定运行 `/opt/maca/ompi/bin/mpirun -n <GPU 数> /opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf`，通过 `MACA_VISIBLE_DEVICES`、`MCCL_IB_HCA`（RoCE 时另设 `MCCL_IB_GID_INDEX`）限定设备；并按 MCCL 环境变量定义设置 `MCCL_IB_DISABLE=0`、`MCCL_NET_DISABLE_INTRA=0`、`MCCL_P2P_LEVEL=LOC`、`MCCL_SHM_DISABLE=1`，显式使用 IB/RoCE 网卡而不落到 PCIe、MetaXLink P2P 或 SHM 通路。选择设备后可点击“查看拓扑”，在弹框中查看所选设备的 CPU/NUMA、PCIe Switch、GPU 和 HCA 完整路径。远程执行沿用单机页“基本信息”中的地址、用户、端口和私钥路径；采集成功后会自动复用当前页面内的 SSH 密码，无需在每项测试前重复输入。
+
+“Pcie/Metax”包含 P2P 和 alltoall。P2P 在当前目标内选择两张 GPU，使用 `/opt/maca/samples/mccl_tests/benchmark/TransferBenchMaca p2p`（参考同目录 `p2p.sh`，设置 `P2P_MODE=1` 并通过 `MACA_VISIBLE_DEVICES` 限定设备），输出 GPU 间单向带宽矩阵和链路类型（MetaxLink/PCIe）。选择两张 GPU 后页面会显示二者之间是否存在 MetaXLink（如 `MX5`）以及 PCIe 距离（`PIX`/`PXB`/`NODE`/`SYS`），并可通过“传输链路”选择自动、优先 PCIe 或优先 MetaXLink（仅在存在 MetaXLink 时可选），对应 TransferBench 的 `USE_PCIE_FIRST` 环境变量。查看拓扑弹框只展示所选 GPU 与其 CPU/PCIe Switch 路径，不显示 RDMA 网卡。alltoall 可勾选多张 GPU，固定运行 `/opt/maca/ompi/bin/mpirun -n <GPU 数> /opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf`，通过 `MCCL_IB_DISABLE=1`、`MCCL_SHM_DISABLE=1`、`MCCL_P2P_LEVEL=SYS`、`MCCL_NET_DISABLE_INTRA=1` 禁用 RDMA 网络与 SHM，强制走 PCIe/MetaXLink P2P 通路。
 
 ## EP 测试
 

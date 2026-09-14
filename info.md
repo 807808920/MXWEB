@@ -21,3 +21,15 @@
   - 执行前检查 GPU 空闲、目标主机、用户权限，并要求显式确认
 
   交换机、BMC/BIOS 设置无法仅靠当前主机 SSH 完整验证，应后续以交换机 SSH/API、Redfish/BMC 作为独立连接器接入。
+
+
+
+
+  服务已配置为常驻并开机自启（用户级 systemd + linger）：
+- 服务文件：~/.config/systemd/user/metax-inspection.service（WorkingDirectory=/home/lchen1/data/web/codex，ExecStart=/usr/local/bin/node server.js，Restart=always，HOST=0.0.0.0 PORT=4173）
+- 已 enable --now，并执行 loginctl enable-linger lchen1（无需登录即随系统启动）
+- 验证：kill -9 后 5 秒内自动拉起（新 PID 22779），端口 4173 正常监听
+常用命令：
+- 状态：systemctl --user status metax-inspection
+- 重启/停止：systemctl --user restart|stop metax-inspection
+- 日志：journalctl --user -u metax-inspection -f

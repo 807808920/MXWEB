@@ -8,6 +8,11 @@ const { StringDecoder } = require('node:string_decoder');
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+function hourVersion(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `v${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}.${pad(date.getHours())}`;
+}
+const APP_VERSION = hourVersion();
 const COLLECTION_TIMEOUT_MS = 120_000;
 const MAX_COLLECTION_OUTPUT = 8 * 1024 * 1024;
 const MAX_TEST_OUTPUT = 4 * 1024 * 1024;
@@ -18,9 +23,24 @@ const SINGLE_EP_STAGE_TIMEOUT_MS = 180_000;
 const TEST_STOP_GRACE_MS = 1_500;
 const TEST_CLEANUP_TIMEOUT_MS = 8_000;
 const IB_WRITE_BW_PATH = '/opt/maca/tools/communication/rdma/perftest/tests/ib_write_bw';
-const MACA_MPIRUN_PATH = '/opt/maca/ompi/bin/mpirun';
-const MCCL_ALLTOALL_PATH = '/opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf';
+const NORTHBOUND_TIMEOUT_MS = 20_000;
+const NORTHBOUND_CHECK_COMMAND = 'ipmitool raw 0x3c 0x05 0x98';
+const NORTHBOUND_REPAIR_COMMANDS = ['ipmitool raw 0x3c 0x28 0xff 0xfc', 'ipmitool raw 0x3c 0x28 0xff 0xfd'];
 const MACA_LIBRARY_PATH_PREVIEW = 'export LD_LIBRARY_PATH=/opt/maca/lib:$LD_LIBRARY_PATH';
+const MACA_PATH_DEFAULT = '/opt/maca';
+function macaInstallPaths(macaPath = MACA_PATH_DEFAULT) {
+  const base = macaPath || MACA_PATH_DEFAULT;
+  return {
+    base,
+    mxSmi: `${base}/bin/mx-smi`,
+    ibWrite: `${base}/tools/communication/rdma/perftest/tests/ib_write_bw`,
+    bench: `${base}/samples/mccl_tests/benchmark/TransferBenchMaca`,
+    mpirun: `${base}/ompi/bin/mpirun`,
+    alltoall: `${base}/samples/mccl_tests/perf/mccl_perf/alltoall_perf`,
+    vectorAddDir: `${base}/samples/0_Introduction/vectorAdd`,
+    mxcc: `${base}/mxgpu_llvm/bin/mxcc`
+  };
+}
 const SINGLE_EP_TEST_DIR = process.env.SINGLEEP_TEST_DIR || '/home/lchen1/data/projs/llopt/codex/singleep/test';
 const SINGLE_EP_RANKS = [1, 2, 4, 8, 16, 32];
 const SINGLE_EP_TOKENS = {
@@ -44,18 +64,30 @@ const COLLECTION_TASKS = [
   ['PCI', 'PCIe 拓扑'], ['NET', '网卡设备'], ['IB', 'InfiniBand 状态'],
   ['IB_NET', 'RDMA 网口映射'], ['OFED', 'OFED 版本'], ['GIDS', 'GID 配置'],
   ['ROCE', 'RoCE 配置'], ['GPU_TOPO', 'GPU 拓扑'], ['GPU_NIC_TOPO', 'GPU / 网卡距离'], ['GPU_HEALTH', 'GPU 状态'],
-  ['MXLK', 'MetaxLink'], ['GPU_PCIE', 'GPU PCIe'], ['MACA', 'GPU 型号']
+  ['MXLK', 'MetaxLink'], ['GPU_PCIE', 'GPU PCIe'], ['MACA', 'GPU 型号'], ['MACA_VERSIONS', 'MACA 版本']
 ];
 const COLLECTION_TASK_LABELS = new Map(COLLECTION_TASKS);
 const TEST_LABELS = new Map([
   ['gpu-vector-add', 'GPU vectorAdd 测试'],
   ['nic-p2p', '网卡 P2P 测试'],
   ['nic-alltoall', '网卡 alltoall 测试'],
-  ['host-ibrc', '单机 IBRC 测试'],
-  ['host-ibgda', '单机 IBGDA 测试']
+  ['pcie-p2p', 'Pcie/Metax P2P 测试'],
+  ['pcie-alltoall', 'Pcie/Metax alltoall 测试']
 ]);
 let activePerformanceTest = null;
 let activeClusterScan = false;
+
+const MACA_VERSIONS_SHELL = String.raw`for d in /opt/maca /opt/maca-*; do
+  [ -d "$d/bin" ] || continue
+  target="$d"
+  if [ -L "$d" ]; then target="$(readlink -f "$d" 2>/dev/null || printf '%s' "$d")"; fi
+  version="$(sed -n 's/^Version://p' "$target/Version.txt" 2>/dev/null | head -n1)"
+  [ -n "$version" ] || version="$(basename "$target")"
+  printf '%s\t%s\t%s\n' "$d" "$target" "$version"
+done
+`;
+const MACA_VERSIONS_PROBE = `set +e\nexport LC_ALL=C\n${MACA_VERSIONS_SHELL}
+`;
 
 // This script only reads hardware state. Its tab-separated format is kept intentionally stable for parsing.
 const INVENTORY_SCRIPT = String.raw`set +e
@@ -253,6 +285,8 @@ gpu_health() { mx-smi -s 2>&1 || /opt/maca/bin/mx-smi -s 2>&1; }
 mxlk() { mx-smi mxlk --show 2>&1 || /opt/maca/bin/mx-smi mxlk --show 2>&1; }
 gpu_pcie() { mx-smi --show-pcie 2>&1 || /opt/maca/bin/mx-smi --show-pcie 2>&1; }
 macainfo() { /opt/maca/bin/macainfo 2>&1 || command macainfo 2>&1; }
+maca_versions() {
+${MACA_VERSIONS_SHELL}}
 collect_task() { task_id="$1"; output="$2"; shift 2; "$@" > "$tmp/$output"; printf '__TOPO_PROGRESS__\t%s\n' "$task_id"; }
 collect_task META META meta &
 collect_task CPU CPU cpu &
@@ -273,16 +307,17 @@ collect_task GPU_HEALTH GPU_HEALTH gpu_health &
 collect_task MXLK MXLK mxlk &
 collect_task GPU_PCIE GPU_PCIE gpu_pcie &
 collect_task MACA MACA macainfo &
+collect_task MACA_VERSIONS MACA_VERSIONS maca_versions &
 wait
-for section in META CPU CPU_GOV SYSTEM DMESG PCI_CTL PCI NET IB IB_NET OFED GIDS ROCE GPU_TOPO GPU_NIC_TOPO GPU_HEALTH MXLK GPU_PCIE MACA; do printf '__%s__\n' "$section"; cat "$tmp/$section" 2>/dev/null; done
+for section in META CPU CPU_GOV SYSTEM DMESG PCI_CTL PCI NET IB IB_NET OFED GIDS ROCE GPU_TOPO GPU_NIC_TOPO GPU_HEALTH MXLK GPU_PCIE MACA MACA_VERSIONS; do printf '__%s__\n' "$section"; cat "$tmp/$section" 2>/dev/null; done
 true`;
 
 function parseSections(output) {
-  const names = ['META', 'CPU', 'CPU_GOV', 'SYSTEM', 'DMESG', 'PCI', 'PCI_CTL', 'NET', 'IB', 'IB_NET', 'OFED', 'GIDS', 'ROCE', 'GPU_TOPO', 'GPU_NIC_TOPO', 'GPU_HEALTH', 'MXLK', 'GPU_PCIE', 'MACA'];
+  const names = ['META', 'CPU', 'CPU_GOV', 'SYSTEM', 'DMESG', 'PCI', 'PCI_CTL', 'NET', 'IB', 'IB_NET', 'OFED', 'GIDS', 'ROCE', 'GPU_TOPO', 'GPU_NIC_TOPO', 'GPU_HEALTH', 'MXLK', 'GPU_PCIE', 'MACA', 'MACA_VERSIONS'];
   const sections = Object.fromEntries(names.map((name) => [name, '']));
   let current = null;
   for (const line of output.split(/\r?\n/)) {
-    const marker = /^__(META|CPU|CPU_GOV|SYSTEM|DMESG|PCI|PCI_CTL|NET|IB|IB_NET|OFED|GIDS|ROCE|GPU_TOPO|GPU_NIC_TOPO|GPU_HEALTH|MXLK|GPU_PCIE|MACA)__$/.exec(line);
+    const marker = /^__(META|CPU|CPU_GOV|SYSTEM|DMESG|PCI|PCI_CTL|NET|IB|IB_NET|OFED|GIDS|ROCE|GPU_TOPO|GPU_NIC_TOPO|GPU_HEALTH|MXLK|GPU_PCIE|MACA|MACA_VERSIONS)__$/.exec(line);
     if (marker) current = marker[1];
     else if (current) sections[current] += `${line}\n`;
   }
@@ -449,6 +484,28 @@ function parseMacainfo(text) {
     marketName = '';
   }
   return { models: [...new Set(models)] };
+}
+
+function parseMacaVersions(text) {
+  const rows = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const [path, resolved, version] = line.trim().split('\t');
+    if (!path || !/^\/opt\/maca/.test(path)) continue;
+    rows.push({ path, resolved: resolved || path, version: version || '' });
+  }
+  rows.sort((left, right) => {
+    if (left.path === '/opt/maca') return -1;
+    if (right.path === '/opt/maca') return 1;
+    return String(right.version).localeCompare(String(left.version), 'zh-CN', { numeric:true });
+  });
+  const installations = [];
+  const seenTargets = new Set();
+  for (const row of rows) {
+    if (seenTargets.has(row.resolved)) continue;
+    seenTargets.add(row.resolved);
+    installations.push(row);
+  }
+  return installations;
 }
 
 function parseContainers(text) {
@@ -693,13 +750,16 @@ function applyCompliance(nodes, cpuGovernors, ofed, controls, system, roce, gpuH
 }
 
 function parseTopo(text) {
-  const rows = text.split(/\r?\n/).filter((line) => /^GPU\d+\s+/.test(line.trim()));
+  const linkLabels = /^(X|PIX|PXB|NODE|SYS|MX[0-9]*|MXLK|NV[0-9]+|PHB)$/;
   const links = [];
-  for (const row of rows) {
-    const cells = row.trim().split(/\s+/);
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!/^GPU\d+\s+/.test(trimmed) || /\bAffinity\b/.test(trimmed)) continue;
+    const cells = trimmed.split(/\s+/);
     const source = Number(cells[0].slice(3));
+    if (!Number.isInteger(source)) continue;
     cells.slice(1).forEach((value, index) => {
-      if (index > source && value !== 'X' && !/^CPU|^NIC/.test(value)) links.push({ source, target: index, label: value });
+      if (index > source && linkLabels.test(value)) links.push({ source, target:index, label:value });
     });
   }
   return links;
@@ -813,6 +873,7 @@ function parseInventory(output, source, requestedProfile = 'auto') {
     nodes: graphNodes, edges, containers,
     gpuLinks: parseTopo(sections.GPU_TOPO),
     gpuNicDistances: parseGpuNicTopo(sections.GPU_NIC_TOPO),
+    macaInstallations: parseMacaVersions(sections.MACA_VERSIONS),
     summary: { cpus: nodes.length, gpus: relevant.filter((item) => item.type === 'gpu').length, nics: relevant.filter((item) => item.type === 'nic').length, switches: relevant.filter((item) => item.type === 'switch').length },
     compliance,
     diagnostics: { ibstat: sections.IB.trim(), gpuTopo: sections.GPU_TOPO.trim(), gpuNicTopo: sections.GPU_NIC_TOPO.trim(), macainfo: sections.MACA.trim(), ofed: sections.OFED.trim(), system: sections.SYSTEM.trim(), dmesg: sections.DMESG.trim(), pcieControls: sections.PCI_CTL.trim(), gids: sections.GIDS.trim(), roce: sections.ROCE.trim(), gpuHealth: sections.GPU_HEALTH.trim(), mxlk: sections.MXLK.trim(), gpuPcie: sections.GPU_PCIE.trim() }
@@ -1144,9 +1205,10 @@ function testRecipe(payload, requestedRunId = createTestRunId()) {
   const params = payload.params && typeof payload.params === 'object' && !Array.isArray(payload.params) ? payload.params : {};
   const gpuA = Number(params.gpuA);
   const gpuB = Number(params.gpuB);
-  const gpuCount = Number(params.gpuCount ?? 2);
+  const pcieGpuA = Number(params.pcieGpuA);
+  const pcieGpuB = Number(params.pcieGpuB);
+  const pciePath = String(params.pciePath || 'auto');
   const gidIndex = Number(params.gidIndex ?? 3);
-  const nic = String(params.nic || '');
   const nicA = String(params.nicA || '');
   const nicB = String(params.nicB || '');
   const transport = String(params.transport ?? 'RoCE');
@@ -1155,11 +1217,11 @@ function testRecipe(payload, requestedRunId = createTestRunId()) {
   const containerId = String(params.containerId || '');
   const imageRuntime = String(params.imageRuntime || '');
   const imageId = String(params.imageId || '');
-  if (!Number.isInteger(gpuCount) || gpuCount < 1 || gpuCount > 64) throw new Error('GPU 数量必须在 1 到 64 之间。');
   if (!Number.isInteger(gidIndex) || gidIndex < 0 || gidIndex > 255) throw new Error('GID Index 必须在 0 到 255 之间。');
+  if (!['auto', 'pcie', 'metaxlink'].includes(pciePath)) throw new Error('P2P 传输链路只支持自动、PCIe 或 MetaXLink。');
   if (!['IB', 'RoCE'].includes(transport)) throw new Error('网络类型只支持 InfiniBand 或 RoCE。');
   if (!['auto', 'dmabuf', 'peermem'].includes(gdrMode)) throw new Error('GDR 显存注册方式无效。');
-  if ([nic, nicA, nicB].some((value) => value && !/^[a-zA-Z0-9_.:-]{1,64}$/.test(value))) throw new Error('RDMA HCA 名称格式无效。');
+  if ([nicA, nicB].some((value) => value && !/^[a-zA-Z0-9_.:-]{1,64}$/.test(value))) throw new Error('RDMA HCA 名称格式无效。');
   if (Boolean(containerRuntime) !== Boolean(containerId)) throw new Error('容器运行时和容器 ID 必须同时提供。');
   if (Boolean(imageRuntime) !== Boolean(imageId)) throw new Error('镜像运行时和镜像 ID 必须同时提供。');
   if (containerId && imageId) throw new Error('运行中的容器和本地镜像不能同时选择。');
@@ -1167,6 +1229,9 @@ function testRecipe(payload, requestedRunId = createTestRunId()) {
   if (containerId && !/^[a-f0-9]{12,64}$/i.test(containerId)) throw new Error('容器 ID 格式无效。');
   if (imageRuntime && !['docker', 'podman', 'nerdctl'].includes(imageRuntime)) throw new Error('不支持该镜像运行时。');
   if (imageId && !/^(?:sha256:)?[a-f0-9]{12,64}$/i.test(imageId)) throw new Error('镜像 ID 格式无效。');
+  const macaPath = String(params.macaPath || MACA_PATH_DEFAULT).replace(/\/+$/, '');
+  if (!/^\/opt\/maca(?:[a-zA-Z0-9._-]+)?$/.test(macaPath)) throw new Error('MACA 路径无效。');
+  const maca = macaInstallPaths(macaPath);
   let gpus = [];
   let nics = [];
   if (testId === 'gpu-vector-add') {
@@ -1181,66 +1246,72 @@ function testRecipe(payload, requestedRunId = createTestRunId()) {
   } else if (testId === 'nic-alltoall') {
     gpus = testGpuList(params.gpus, 'alltoall', 2);
     nics = testNicList(params.nics);
+  } else if (testId === 'pcie-p2p') {
+    if (!Number.isInteger(pcieGpuA) || !Number.isInteger(pcieGpuB)) throw new Error('请为 P2P 两端分别选择 GPU。');
+    if (pcieGpuA === pcieGpuB) throw new Error('P2P 两端必须选择不同 GPU。');
+    gpus = testGpuList([pcieGpuA, pcieGpuB], 'Pcie/Metax P2P', 2);
+  } else if (testId === 'pcie-alltoall') {
+    gpus = testGpuList(params.gpus, 'Pcie/Metax alltoall', 2);
   }
-  const nicTests = new Set(['host-ibrc', 'host-ibgda']);
-  const multiGpuTests = new Set(['host-ibrc', 'host-ibgda']);
-  if (nicTests.has(testId) && !nic) throw new Error('该测试需要选择 RDMA HCA。');
-  if (multiGpuTests.has(testId) && gpuCount < 2) throw new Error('该测试至少需要 2 张 GPU。');
 
   const common = [
     'set -e',
-    'export MACA_PATH=/opt/maca',
-    'export PATH="/opt/maca/bin:/opt/maca/mxgpu_llvm/bin:${PATH:-/usr/bin:/bin}"',
-    'export LD_LIBRARY_PATH="/opt/maca/lib:/opt/maca/ompi/lib:/opt/maca/ucx/lib:/opt/maca/mxgpu_llvm/lib:${LD_LIBRARY_PATH:-}"',
+    `export MACA_PATH=${maca.base}`,
+    `export PATH="${maca.base}/bin:${maca.base}/mxgpu_llvm/bin:\${PATH:-/usr/bin:/bin}"`,
+    `export LD_LIBRARY_PATH="${maca.base}/lib:${maca.base}/ompi/lib:${maca.base}/ucx/lib:${maca.base}/mxgpu_llvm/lib:\${LD_LIBRARY_PATH:-}"`,
     'first_exec() { for candidate in "$@"; do if [ -x "$candidate" ]; then printf "%s\\n" "$candidate"; return 0; fi; done; printf "缺少测试程序：%s\\n" "$*" >&2; return 127; }',
     `printf '=== ${TEST_LABELS.get(testId)} ===\\n'`,
     'printf "开始时间：%s\\n" "$(date -Is)"'
   ];
-  const allGpuPreflight = [
-    'busy_gpu="$( { mx-smi -s 2>/dev/null || /opt/maca/bin/mx-smi -s 2>/dev/null || true; } | awk \'/^[[:space:]]*GPU[[:space:]]*:/ { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { print value; exit } }\')"',
-    'if [ -n "$busy_gpu" ]; then printf "检测到 GPU 使用率 %s%%，为避免影响现有任务已拒绝启动。\\n" "$busy_gpu" >&2; exit 3; fi'
-  ];
   let lines = [...common];
   let preview = '';
   let timeoutMs = 180_000;
-  if (testId.startsWith('host-')) lines.push(...allGpuPreflight);
-  if (testId === 'nic-p2p' || testId === 'nic-alltoall') {
+  if (['nic-p2p', 'nic-alltoall', 'pcie-p2p', 'pcie-alltoall'].includes(testId)) {
     const selectedGpuCsv = gpus.join(',');
     lines.push(
-      `busy_gpu="$( { mx-smi -s 2>/dev/null || /opt/maca/bin/mx-smi -s 2>/dev/null || true; } | awk -v wanted=',${selectedGpuCsv},' '/^GPU#[0-9]+[[:space:]]/ { gpu=$1; sub(/^GPU#/, "", gpu); selected=index(wanted, "," gpu ",") > 0 } /^[[:space:]]*GPU[[:space:]]*:/ && selected { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { printf "GPU %s: %s%%", gpu, value; exit } }')"`,
+      `busy_gpu="$( { mx-smi -s 2>/dev/null || ${maca.mxSmi} -s 2>/dev/null || true; } | awk -v wanted=',${selectedGpuCsv},' '/^GPU#[0-9]+[[:space:]]/ { gpu=$1; sub(/^GPU#/, "", gpu); selected=index(wanted, "," gpu ",") > 0 } /^[[:space:]]*GPU[[:space:]]*:/ && selected { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { printf "GPU %s: %s%%", gpu, value; exit } }')"`,
       'if [ -n "$busy_gpu" ]; then printf "检测到所选 %s 使用率超过 5%%，为避免影响现有任务已拒绝启动。\\n" "$busy_gpu" >&2; exit 3; fi'
     );
   }
 
   if (testId === 'gpu-vector-add') {
     timeoutMs = Math.min(300_000, 80_000 + gpus.length * 10_000);
-    preview = `for gpu in ${gpus.join(' ')}; do MACA_VISIBLE_DEVICES=$gpu vectorAdd; done`;
+    preview = `for gpu in ${gpus.join(' ')}; do MACA_VISIBLE_DEVICES=$gpu vectorAdd & done; wait`;
     const selectedGpuCsv = gpus.join(',');
     lines.push(
       `selected_gpus=${shellSingleQuote(gpus.join(' '))}`,
       `selected_gpu_count=${gpus.length}`,
-      `busy_gpu="$( { mx-smi -s 2>/dev/null || /opt/maca/bin/mx-smi -s 2>/dev/null || true; } | awk -v wanted=',${selectedGpuCsv},' '/^GPU#[0-9]+[[:space:]]/ { gpu=$1; sub(/^GPU#/, "", gpu); selected=index(wanted, "," gpu ",") > 0 } /^[[:space:]]*GPU[[:space:]]*:/ && selected { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { printf "GPU %s: %s%%", gpu, value; exit } }')"`,
+      `busy_gpu="$( { mx-smi -s 2>/dev/null || ${maca.mxSmi} -s 2>/dev/null || true; } | awk -v wanted=',${selectedGpuCsv},' '/^GPU#[0-9]+[[:space:]]/ { gpu=$1; sub(/^GPU#/, "", gpu); selected=index(wanted, "," gpu ",") > 0 } /^[[:space:]]*GPU[[:space:]]*:/ && selected { value=$3; gsub(/%/, "", value); if ((value + 0) > 5) { printf "GPU %s: %s%%", gpu, value; exit } }')"`,
       'if [ -n "$busy_gpu" ]; then printf "检测到所选 %s 使用率超过 5%%，为避免影响现有任务已拒绝启动。\\n" "$busy_gpu" >&2; exit 3; fi',
-      'sample_dir=/opt/maca/samples/0_Introduction/vectorAdd',
-      'compiler=/opt/maca/mxgpu_llvm/bin/mxcc',
+      `sample_dir=${shellSingleQuote(maca.vectorAddDir)}`,
+      `compiler=${shellSingleQuote(maca.mxcc)}`,
       '[ -r "$sample_dir/vectorAdd.cpp" ] || { echo "未安装 vectorAdd 示例源码。" >&2; exit 127; }',
       '[ -x "$compiler" ] || { echo "未安装 mxcc 编译器。" >&2; exit 127; }',
       'work_dir="$(mktemp -d)"',
-      'trap \'rm -rf "$work_dir"\' EXIT',
-      '"$compiler" -x maca -offload-arch native "$sample_dir/vectorAdd.cpp" -o "$work_dir/vectorAdd" --maca-path=/opt/maca',
+      'vector_log_dir="$(mktemp -d)"',
+      'trap \'rm -rf "$work_dir" "$vector_log_dir"\' EXIT',
+      `"$compiler" -x maca -offload-arch native "$sample_dir/vectorAdd.cpp" -o "$work_dir/vectorAdd" --maca-path=${shellSingleQuote(maca.base)}`,
+      'vector_pids=""',
+      'for gpu_index in $selected_gpus; do',
+      '  printf "启动 GPU %s vectorAdd（并行执行）\\n" "$gpu_index"',
+      '  ( vector_status=0; MACA_VISIBLE_DEVICES="$gpu_index" "$work_dir/vectorAdd" >"$vector_log_dir/gpu-$gpu_index.log" 2>&1 || vector_status=$?; printf "%s" "$vector_status" >"$vector_log_dir/gpu-$gpu_index.status" ) &',
+      '  vector_pids="$vector_pids $!"',
+      'done',
+      'for vector_pid in $vector_pids; do wait "$vector_pid" || true; done',
       'vector_failures=0',
       'for gpu_index in $selected_gpus; do',
       '  printf "\\n--- GPU %s vectorAdd ---\\n" "$gpu_index"',
-      '  if MACA_VISIBLE_DEVICES="$gpu_index" "$work_dir/vectorAdd"; then',
+      '  cat "$vector_log_dir/gpu-$gpu_index.log"',
+      '  vector_status="$(cat "$vector_log_dir/gpu-$gpu_index.status" 2>/dev/null || printf 1)"',
+      '  if [ "$vector_status" -eq 0 ]; then',
       '    printf "[GPU %s] 通过\\n" "$gpu_index"',
       '  else',
-      '    gpu_exit=$?',
-      '    printf "[GPU %s] 失败（退出码 %s）\\n" "$gpu_index" "$gpu_exit" >&2',
+      '    printf "[GPU %s] 失败（退出码 %s）\\n" "$gpu_index" "$vector_status" >&2',
       '    vector_failures=$((vector_failures + 1))',
       '  fi',
       'done',
       'if [ "$vector_failures" -ne 0 ]; then printf "vectorAdd 汇总：%s/%s 张 GPU 失败。\\n" "$vector_failures" "$selected_gpu_count" >&2; exit 1; fi',
-      'printf "vectorAdd 汇总：所选 GPU（%s）全部通过。\\n" "${selected_gpus// /,}"'
+      'printf "vectorAdd 汇总：所选 GPU（%s）并行测试全部通过。\\n" "${selected_gpus// /,}"'
     );
   } else if (testId === 'nic-p2p') {
     const gidOption = transport === 'RoCE' ? ` -x ${gidIndex}` : '';
@@ -1250,9 +1321,9 @@ function testRecipe(payload, requestedRunId = createTestRunId()) {
     const gdrPreviewLabel = gdrMode === 'dmabuf'
       ? 'DMA-BUF（追加 --use_maca_dmabuf）'
       : gdrMode === 'peermem' ? 'PEERMEM（不追加 --use_maca_dmabuf）' : '运行时自动检测 DMA-BUF / PEERMEM';
-    preview = `GDR: ${gdrPreviewLabel}\nserver: ${IB_WRITE_BW_PATH} -a${mxrdmaOptions} -d ${nics[0]} --use_maca=${gpus[0]}${gidOption} -p ${p2pPort}${gdrPreviewOption} &\nclient: ${IB_WRITE_BW_PATH} -a${mxrdmaOptions} -d ${nics[1]} --use_maca=${gpus[1]}${gidOption} -p ${p2pPort} localhost${gdrPreviewOption}`;
+    preview = `GDR: ${gdrPreviewLabel}\nserver: ${maca.ibWrite} -a${mxrdmaOptions} -d ${nics[0]} --use_maca=${gpus[0]}${gidOption} -p ${p2pPort}${gdrPreviewOption} &\nclient: ${maca.ibWrite} -a${mxrdmaOptions} -d ${nics[1]} --use_maca=${gpus[1]}${gidOption} -p ${p2pPort} localhost${gdrPreviewOption}`;
     lines.push(
-      `ib_write=${shellSingleQuote(IB_WRITE_BW_PATH)}`,
+      `ib_write=${shellSingleQuote(maca.ibWrite)}`,
       '[ -x "$ib_write" ] || { printf "缺少测试程序：%s\\n" "$ib_write" >&2; exit 127; }',
       `p2p_gdr_hint=${shellSingleQuote(gdrMode)}`,
       'p2p_peer_mem=unknown',
@@ -1373,10 +1444,10 @@ function testRecipe(payload, requestedRunId = createTestRunId()) {
     const selectedGpuCsv = gpus.join(',');
     const selectedNicCsv = nics.join(',');
     const gidEnvironment = transport === 'RoCE' ? ` MCCL_IB_GID_INDEX=${gidIndex}` : '';
-    preview = `MACA_VISIBLE_DEVICES=${selectedGpuCsv} MCCL_IB_HCA=${selectedNicCsv}${gidEnvironment} MCCL_IB_DISABLE=0 MCCL_NET_DISABLE_INTRA=0 MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1 ${MACA_MPIRUN_PATH} -n ${gpus.length} ${MCCL_ALLTOALL_PATH}`;
+    preview = `MACA_VISIBLE_DEVICES=${selectedGpuCsv} MCCL_IB_HCA=${selectedNicCsv}${gidEnvironment} MCCL_IB_DISABLE=0 MCCL_NET_DISABLE_INTRA=0 MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1 ${maca.mpirun} -n ${gpus.length} ${maca.alltoall}`;
     lines.push(
-      `mpi=${shellSingleQuote(MACA_MPIRUN_PATH)}`,
-      `perf=${shellSingleQuote(MCCL_ALLTOALL_PATH)}`,
+      `mpi=${shellSingleQuote(maca.mpirun)}`,
+      `perf=${shellSingleQuote(maca.alltoall)}`,
       '[ -x "$mpi" ] || { printf "缺少测试程序：%s\\n" "$mpi" >&2; exit 127; }',
       '[ -x "$perf" ] || { printf "缺少测试程序：%s\\n" "$perf" >&2; exit 127; }',
       `export MACA_VISIBLE_DEVICES=${selectedGpuCsv} MCCL_IB_HCA=${selectedNicCsv}`,
@@ -1387,30 +1458,39 @@ function testRecipe(payload, requestedRunId = createTestRunId()) {
       'printf "通信通路：RDMA HCA（IB/RoCE）；已禁用 PCIe/MetaXLink P2P 与 SHM。\\n"',
       `exec "$mpi" -n ${gpus.length} "$perf"`
     );
-  } else if (testId === 'host-ibrc') {
-    timeoutMs = 300_000;
-    preview = `MCCL_P2P_LEVEL=LOC MCCL_IB_HCA=${nic} mpirun -n ${gpuCount} alltoall_perf`;
+  } else if (testId === 'pcie-p2p') {
+    timeoutMs = 180_000;
+    const pathLabel = pciePath === 'pcie' ? '优先 PCIe' : pciePath === 'metaxlink' ? '优先 MetaXLink' : '自动（MetaXLink 优先）';
+    const pathEnv = pciePath === 'pcie' ? 'USE_PCIE_FIRST=1 ' : pciePath === 'metaxlink' ? 'USE_PCIE_FIRST=0 ' : '';
+    preview = `${pathEnv}MACA_VISIBLE_DEVICES=${gpus.join(',')} P2P_MODE=1 ${maca.bench} p2p`;
     lines.push(
-      'mpi="$(first_exec /opt/maca/ompi/bin/mpirun /usr/bin/mpirun)"',
-      'perf="$(first_exec /opt/maca/tools/communication/mccl/mccl_perf/alltoall_perf /opt/maca/samples/mccl_tests/perf/mccl_perf/alltoall_perf)"',
-      `export MCCL_IB_HCA=${nic} MCCL_P2P_LEVEL=LOC MCCL_SHM_DISABLE=1 MCCL_NET_GDR_LEVEL=SYS`,
-      `exec "$mpi" --allow-run-as-root -n ${gpuCount} -mca pml ^ucx -mca osc ^ucx -mca btl ^openib -x METAX_INSPECTION_RUN_ID -x LD_LIBRARY_PATH -x MCCL_IB_HCA -x MCCL_P2P_LEVEL -x MCCL_SHM_DISABLE -x MCCL_NET_GDR_LEVEL "$perf" -b 1M -e 256M -f 2 -g 1 -n 5`
+      `bench=${shellSingleQuote(maca.bench)}`,
+      '[ -x "$bench" ] || { printf "缺少测试程序：%s\\n" "$bench" >&2; exit 127; }',
+      `export MACA_VISIBLE_DEVICES=${gpus.join(',')}`,
+      'export P2P_MODE=1',
+      pciePath === 'pcie' ? 'export USE_PCIE_FIRST=1' : pciePath === 'metaxlink' ? 'export USE_PCIE_FIRST=0' : 'unset USE_PCIE_FIRST',
+      `printf 'P2P 设备：GPU ${gpus[0]} ↔ GPU ${gpus[1]}；链路策略：%s；参考 %s/p2p.sh\\n' ${shellSingleQuote(pathLabel)} "$(dirname "$bench")"`,
+      'exec "$bench" p2p'
     );
-  } else if (testId === 'host-ibgda') {
+  } else if (testId === 'pcie-alltoall') {
     timeoutMs = 300_000;
-    preview = `MXSHMEM_DISABLE_P2P=1 MXSHMEM_HCA_LIST=${nic}:1 python test_internode.py -n ${gpuCount}`;
+    const selectedGpuCsv = gpus.join(',');
+    preview = `MACA_VISIBLE_DEVICES=${selectedGpuCsv} MCCL_IB_DISABLE=1 MCCL_SHM_DISABLE=1 MCCL_P2P_LEVEL=SYS MCCL_NET_DISABLE_INTRA=1 ${maca.mpirun} -n ${gpus.length} ${maca.alltoall} -b 1M -e 256M -f 2 -g 1 -n 5`;
     lines.push(
-      'python_bin="$(command -v python3 || command -v python || true)"',
-      '[ -n "$python_bin" ] || { echo "未安装 Python。" >&2; exit 127; }',
-      'test_file=/opt/maca/tools/communication/mxdeepep/tests/test_internode.py',
-      '[ -r "$test_file" ] || { echo "未安装 mxdeepep IBGDA 测试。" >&2; exit 127; }',
-      `export MXSHMEM_DISABLE_P2P=1 MXSHMEM_HCA_LIST=${nic}:1 MXDEEPEP_EXT_MAX_MXL_PEERS=4`,
-      nic.startsWith('metax_rdma_') ? 'export MXSHMEM_GDA_PROVIDER=mrdma' : ':',
-      `exec "$python_bin" "$test_file" -n ${gpuCount} -t 1024 -d 4096 -k 8 -e 256`
+      `mpi=${shellSingleQuote(maca.mpirun)}`,
+      `perf=${shellSingleQuote(maca.alltoall)}`,
+      '[ -x "$mpi" ] || { printf "缺少测试程序：%s\\n" "$mpi" >&2; exit 127; }',
+      '[ -x "$perf" ] || { printf "缺少测试程序：%s\\n" "$perf" >&2; exit 127; }',
+      `export MACA_VISIBLE_DEVICES=${selectedGpuCsv}`,
+      'unset MCCL_IB_HCA MCCL_IB_GID_INDEX MCCL_NET_GDR_LEVEL MCCL_CROSS_NIC',
+      'export MCCL_IB_DISABLE=1 MCCL_SHM_DISABLE=1 MCCL_P2P_LEVEL=SYS MCCL_NET_DISABLE_INTRA=1',
+      'if [ "$(id -u)" -eq 0 ]; then export OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1; fi',
+      'printf "通信通路：PCIe/MetaXLink P2P；已禁用 RDMA 网络与 SHM。\\n"',
+      `exec "$mpi" -n ${gpus.length} "$perf" -b 1M -e 256M -f 2 -g 1 -n 5`
     );
   }
   lines.push('printf "结束时间：%s\\n" "$(date -Is)"');
-  preview = `${MACA_LIBRARY_PATH_PREVIEW}\n${preview}`;
+  preview = `export LD_LIBRARY_PATH=${maca.base}/lib:$LD_LIBRARY_PATH\n${preview}`;
   let script = `${lines.join('\n')}\n`;
   let execution = { kind:'host' };
   if (containerRuntime && containerId) {
@@ -2015,7 +2095,7 @@ function normalizeTestTarget(target) {
   if (!['local', 'remote'].includes(target.kind)) throw new Error('测试目标类型无效。');
   const password = typeof target.password === 'string' ? target.password : '';
   if (password.length > 512 || /[\r\n\0]/.test(password)) throw new Error('密码格式无效。');
-  if (target.kind !== 'remote') return { kind:'local', password:'' };
+  if (target.kind !== 'remote') return { kind:'local', password };
   if (!/^[a-zA-Z0-9][a-zA-Z0-9.:-]*$/.test(target.host || '')) throw new Error('远程地址格式无效。');
   if (target.user && !/^[a-z_][a-z0-9_-]*$/i.test(target.user)) throw new Error('SSH 用户名格式无效。');
   const port = Number(target.port) || 22;
@@ -2049,6 +2129,184 @@ function rawTestLaunch(target, script) {
     return { command:'bash', args:['-s'], input:script, fdPassword:'', target:normalized };
   }
   return { ...remoteSshCommandLaunch(normalized, 'bash -s'), input:script };
+}
+
+function northboundScript(action) {
+  const commands = action === 'repair' ? NORTHBOUND_REPAIR_COMMANDS : [NORTHBOUND_CHECK_COMMAND];
+  const lines = [
+    'set +e',
+    'export LC_ALL=C',
+    'export PATH="/usr/sbin:/sbin:/usr/bin:/bin:${PATH:-}"',
+    'command -v ipmitool >/dev/null 2>&1 || { printf "未找到 ipmitool，请先在目标机器安装 ipmitool。\\n" >&2; exit 127; }',
+    'nb_status=0'
+  ];
+  for (const command of commands) {
+    lines.push(`printf '$ ${command}\\n'`);
+    lines.push(command);
+    lines.push('nb_rc=$?');
+    lines.push('if [ "$nb_rc" -ne 0 ] && [ "$nb_status" -eq 0 ]; then nb_status=$nb_rc; fi');
+  }
+  lines.push('exit "$nb_status"');
+  return lines.join('\n') + '\n';
+}
+
+function northboundRequest(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('北向网络测试请求格式无效。');
+  const action = String(payload.action || '');
+  if (!['check', 'repair'].includes(action)) throw new Error('不支持该北向网络操作。');
+  if (action === 'repair' && payload.confirm !== true) throw new Error('修复北向路由会重启机器，请先确认。');
+  return { action, target:normalizeTestTarget(payload.target) };
+}
+
+function northboundState(action, stdout) {
+  if (action !== 'check') return 'unknown';
+  const bytes = String(stdout || '').split(/\r?\n/)
+    .filter((line) => !line.startsWith('$ '))
+    .join(' ').trim().split(/\s+/).filter(Boolean)
+    .map((token) => token.replace(/^0x/i, '').toUpperCase());
+  if (bytes.includes('00')) return 'error';
+  if (bytes.includes('01')) return 'normal';
+  return 'unknown';
+}
+
+function runNorthbound({ action, target }) {
+  const script = northboundScript(action);
+  const encoded = Buffer.from(script, 'utf8').toString('base64');
+  const executeScript = `printf %s '${encoded}' | base64 -d | bash -s`;
+  let command;
+  let args;
+  let input = '';
+  let fdPassword = '';
+  if (target.kind === 'remote') {
+    const sshArgs = [
+      '-o', `BatchMode=${target.password ? 'no' : 'yes'}`,
+      '-o', 'NumberOfPasswordPrompts=1',
+      '-o', 'StrictHostKeyChecking=accept-new',
+      '-o', 'ConnectTimeout=8',
+      '-p', String(target.port)
+    ];
+    if (target.identityFile) sshArgs.push('-i', target.identityFile);
+    const sudoExec = target.password
+      ? `sudo -S -p '' bash -c ${shellSingleQuote(executeScript)}`
+      : `sudo -n bash -c ${shellSingleQuote(executeScript)}`;
+    const remoteCommand = `if [ "$(id -u)" -eq 0 ]; then ${executeScript}; else ${sudoExec}; fi`;
+    sshArgs.push(`${target.user ? `${target.user}@` : ''}${target.host}`, remoteCommand);
+    if (target.password) {
+      command = 'sshpass'; args = ['-d', '3', 'ssh', ...sshArgs]; fdPassword = target.password; input = `${target.password}\n`;
+    } else {
+      command = 'ssh'; args = sshArgs;
+    }
+  } else if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    command = 'bash'; args = ['-s']; input = script;
+  } else if (target.password) {
+    command = 'sudo'; args = ['-S', '-p', '', 'bash', '-c', script]; input = `${target.password}\n`;
+  } else {
+    command = 'sudo'; args = ['-n', 'bash', '-c', script];
+  }
+  return new Promise((resolve, reject) => {
+    const hasPasswordFd = Boolean(fdPassword);
+    let child;
+    try {
+      child = spawn(command, args, { detached:true, stdio:hasPasswordFd ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      return reject(error);
+    }
+    const startedAt = Date.now();
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timer = null;
+    const appendLimited = (current, chunk) => current.length >= 65_536 ? current : (current + chunk.toString('utf8')).slice(0, 65_536);
+    const finish = (error, code = null, signal = null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) return reject(error);
+      const output = [stdout, stderr ? `[stderr]\n${stderr}` : ''].filter(Boolean).join('\n').trim();
+      resolve({ action, state:northboundState(action, stdout), exitCode:code, signal, durationMs:Date.now() - startedAt, output });
+    };
+    child.stdout.on('data', (chunk) => { stdout = appendLimited(stdout, chunk); });
+    child.stderr.on('data', (chunk) => { stderr = appendLimited(stderr, chunk); });
+    child.stdin.on('error', () => {});
+    child.on('error', (error) => finish(error));
+    child.on('close', (code, signal) => finish(null, code, signal));
+    if (hasPasswordFd) { child.stdio[3].on('error', () => {}); child.stdio[3].end(`${fdPassword}\n`); }
+    child.stdin.end(input);
+    timer = setTimeout(() => {
+      terminateProcessGroup(child);
+      finish(new Error(`北向网络命令超过 ${NORTHBOUND_TIMEOUT_MS / 1000} 秒未返回。`));
+    }, NORTHBOUND_TIMEOUT_MS);
+  });
+}
+
+function environmentProbeRequest(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('MACA 版本检测请求格式无效。');
+  const environment = payload.environment;
+  if (!environment || typeof environment !== 'object' || Array.isArray(environment)) throw new Error('请选择运行环境。');
+  const kind = String(environment.kind || '');
+  if (!['container', 'image'].includes(kind)) throw new Error('运行环境类型无效。');
+  const runtime = String(environment.runtime || '');
+  if (!['docker', 'podman', 'nerdctl'].includes(runtime)) throw new Error('不支持该容器运行时。');
+  const id = String(environment.id || '').toLowerCase();
+  if (kind === 'container') {
+    if (!/^[a-f0-9]{12,64}$/i.test(id)) throw new Error('容器 ID 格式无效。');
+  } else if (!/^(?:sha256:)?[a-f0-9]{12,64}$/i.test(id)) {
+    throw new Error('镜像 ID 格式无效。');
+  }
+  return { kind, runtime, id, target:normalizeTestTarget(payload.target) };
+}
+
+function runEnvironmentMacaProbe(environment) {
+  const inspects = environment.kind === 'container'
+    ? `${environment.runtime} exec -i ${environment.id} sh -c ${shellSingleQuote(MACA_VERSIONS_PROBE)}`
+    : `${environment.runtime} run --rm --network=none --entrypoint /bin/sh ${environment.id} -c ${shellSingleQuote(MACA_VERSIONS_PROBE)}`;
+  let command;
+  let args;
+  let fdPassword = '';
+  if (environment.target.kind === 'remote') {
+    const launch = remoteSshCommandLaunch(environment.target, inspects);
+    command = launch.command;
+    args = launch.args;
+    fdPassword = launch.fdPassword || '';
+  } else {
+    command = 'bash';
+    args = ['-c', inspects];
+  }
+  return new Promise((resolve, reject) => {
+    const hasPasswordFd = Boolean(fdPassword);
+    let child;
+    try {
+      child = spawn(command, args, { detached:true, stdio:hasPasswordFd ? ['pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      return reject(error);
+    }
+    const startedAt = Date.now();
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timer = null;
+    const appendLimited = (current, chunk) => current.length >= 65_536 ? current : (current + chunk.toString('utf8')).slice(0, 65_536);
+    const finish = (error, code = null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      const output = [stdout, stderr ? `[stderr]\n${stderr}` : ''].filter(Boolean).join('\n').trim();
+      if (error) return reject(error);
+      if (code !== 0) return reject(new Error(output || `容器/镜像内 MACA 版本检测失败（退出码 ${code}）。`));
+      resolve({ installations:parseMacaVersions(stdout), output, durationMs:Date.now() - startedAt });
+    };
+    child.stdout.on('data', (chunk) => { stdout = appendLimited(stdout, chunk); });
+    child.stderr.on('data', (chunk) => { stderr = appendLimited(stderr, chunk); });
+    child.stdin.on('error', () => {});
+    child.on('error', (error) => finish(error));
+    child.on('close', (code) => finish(null, code));
+    if (hasPasswordFd) { child.stdio[3].on('error', () => {}); child.stdio[3].end(`${fdPassword}\n`); }
+    child.stdin.end();
+    timer = setTimeout(() => {
+      terminateProcessGroup(child);
+      finish(new Error('容器/镜像内 MACA 版本检测超过 30 秒。'));
+    }, 30_000);
+  });
 }
 
 function taggedTestScript(script, requestedRunId) {
@@ -2414,6 +2672,49 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+  if (req.method === 'POST' && url.pathname === '/api/maca-versions') {
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 10_000) return sendJson(res, 413, { error:'请求过大。' });
+    }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJson(res, 400, { error:'请求不是有效的 JSON。' }); }
+    let environment;
+    try { environment = environmentProbeRequest(payload); }
+    catch (error) { return sendJson(res, 400, { error:errorMessage(error) }); }
+    try {
+      const result = await runEnvironmentMacaProbe(environment);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, { error:errorMessage(error) });
+    }
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/northbound') {
+    let body = '';
+    for await (const chunk of req) {
+      body += chunk;
+      if (body.length > 10_000) return sendJson(res, 413, { error:'请求过大。' });
+    }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJson(res, 400, { error:'请求不是有效的 JSON。' }); }
+    let request;
+    try { request = northboundRequest(payload); }
+    catch (error) { return sendJson(res, 400, { error:errorMessage(error) }); }
+    if (activePerformanceTest) {
+      return sendJson(res, 409, { error:`已有测试正在运行：${activePerformanceTest.label}。请等待完成后再执行北向网络操作。` });
+    }
+    try {
+      const result = await runNorthbound(request);
+      sendJson(res, 200, result);
+    } catch (error) {
+      sendJson(res, 500, { error:errorMessage(error) });
+    }
+    return;
+  }
   if (req.method === 'POST' && url.pathname === '/api/tests/stop') {
     let body = '';
     for await (const chunk of req) {
@@ -2507,6 +2808,11 @@ const server = http.createServer(async (req, res) => {
   const fullPath = path.resolve(PUBLIC_DIR, file);
   if (!fullPath.startsWith(PUBLIC_DIR) || !fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) { res.writeHead(404); return res.end('Not found'); }
   const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'application/javascript; charset=utf-8' };
+  if (file === 'index.html') {
+    const html = fs.readFileSync(fullPath, 'utf8').replaceAll('__APP_VERSION__', APP_VERSION);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(html);
+  }
   res.writeHead(200, { 'Content-Type': types[path.extname(fullPath)] || 'application/octet-stream' });
   fs.createReadStream(fullPath).pipe(res);
 });
